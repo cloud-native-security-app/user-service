@@ -2994,14 +2994,17 @@ version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
  "chrono",
+ "http",
  "secrecy",
  "serde",
  "serde_json",
  "sqlx",
+ "subtle",
  "testcontainers",
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

@@ -73,6 +73,7 @@
       "name": "user_profile_api",
       "title": "API HTTP: perfil de usuario",
       "description": "Endpoints axum para crear/actualizar y consultar el perfil de un usuario, autorizados a nivel de fila contra la identidad reenviada por el Gateway.",
+      "status": "done",
       "acceptance": [
         "src/api.rs (o un submódulo) expone PUT /users/me (upsert del perfil del llamante) y GET /users/me (perfil del llamante) usando axum",
         "Cada handler exige un header de identidad reenviado por el Gateway (p. ej. X-Forwarded-User o equivalente, nombre exacto documentado en rustdoc) y lo usa como único origen de verdad de user_id — nunca confía en un user_id del cuerpo/query",
@@ -80,8 +81,7 @@
         "Ausencia del header de identidad responde 400/401 explícito, nunca un panic ni un 500 genérico",
         "Ningún mensaje de error ni log de esta feature incluye el email o nombre del usuario (ver docs/security-scope.md)",
         "Tests de integración (#[ignore = \"requiere Docker\"], contenedor Postgres real): upsert crea el perfil, GET posterior lo refleja, falta la credencial de servicio -> 401, falta el header de identidad -> 400/401"
-      ],
-      "status": "pending"
+      ]
     },
     {
       "id": 6,

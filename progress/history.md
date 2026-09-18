@@ -143,3 +143,39 @@ la sesión que implemente la feature 1 (`scaffolding`)._
   revocado) por la que `ms_usuarios_app` pudiera mutar `audit_log`, y
   re-ejecutó los tests de integración contra Docker real. Veredicto
   `APPROVED` en `progress/review_4.md`.
+
+## Sesión — feature 5 (user_profile_api) — 2026-09-18
+
+**Estado final:** `done` (aprobada, ver `progress/review_5.md`).
+
+- `src/api.rs`: `pub fn router(repository: Repository, gateway_shared_secret: SecretString) -> axum::Router`
+  con `PUT /users/me` (upsert del perfil del llamante) y `GET /users/me`
+  (perfil del llamante), reutilizando `Repository::upsert_user`/`find_user`
+  de la feature 4 sin modificarlos.
+- Middleware `require_gateway_and_identity`: exige el header `X-Gateway-Secret`
+  (comparado en tiempo constante vía `subtle` contra `Config.gateway_shared_secret`)
+  y el header `X-Forwarded-User` — ambos ANTES de tocar la base de datos.
+  Ausencia/valor incorrecto de la credencial -> `401`; ausencia del header
+  de identidad -> `400`/`401`. El `user_id` sale únicamente de ese header,
+  nunca del cuerpo/query.
+- `ApiError`/`ApiErrorBody` nunca serializan email, `display_name` ni
+  detalle interno de `RepoError` hacia el cliente HTTP — un fallo de
+  `RepoError` colapsa a un error genérico.
+- `tests/api.rs`: 7 tests de integración `#[ignore = "requiere Docker"]`
+  contra Postgres real (mismo patrón de `tests/repository.rs`), ejerciendo
+  el router real vía `tower::ServiceExt::oneshot`: PUT crea el perfil, GET
+  posterior lo refleja, falta credencial de servicio -> 401 antes de tocar
+  la DB, falta header de identidad -> 400/401, entre otros.
+- `Cargo.toml`: añadidas `subtle` (dependencia) y `tower`/`http`
+  (dev-dependencias).
+- Alcance: no se tocó `src/repository.rs`, `src/domain.rs`, `src/config.rs`
+  ni `src/audit.rs`; no se implementó nada de `scan_history_api` (id 6) ni
+  `service_wiring` (id 7) — `router(...)` queda listo para que la feature 7
+  lo ensamble con un `Config`/pool reales.
+- `./init.sh` completo en verde, incluyendo `cargo test -- --ignored`
+  (7/7 de `tests/api.rs` + 9/9 de `tests/repository.rs`, sin regresión)
+  contra Docker real.
+- Revisión: `reviewer` independiente lanzado por el líder confirmó el orden
+  real de validación (credencial antes que identidad, ambas antes que la
+  DB) y la ausencia de fuga de datos personales en errores/logs. Veredicto
+  `APPROVED` en `progress/review_5.md`.

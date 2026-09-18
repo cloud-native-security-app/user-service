@@ -30,3 +30,8 @@ migrar el esquema por sí mismo. Cuando se implemente `service_wiring`, hay
 que decidir explícitamente si las migraciones de producción corren con un
 rol migrador separado y un paso de despliegue distinto del arranque del
 binario, o alguna otra estrategia — no asumirlo implícitamente.
+
+Además, la feature `user_profile_api` (id 5) dejó lista
+`api::router(repository: Repository, gateway_shared_secret: SecretString) -> axum::Router`
+para que `service_wiring` la ensamble con el `Config`/pool reales — revisar
+`src/api.rs` para la firma exacta antes de escribir `src/wiring.rs`.
