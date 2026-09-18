@@ -40,3 +40,30 @@ la sesión que implemente la feature 1 (`scaffolding`)._
   `.claude/agents/reviewer.md` (mismos docs, mismos checkpoints, misma
   ejecución de `./init.sh`), documentada en `progress/review_1.md` con
   veredicto `APPROVED` y esta limitación anotada explícitamente.
+- Nota posterior del líder: se lanzó además un `reviewer` independiente real
+  (el implementer no tiene acceso a `Agent`) que repitió la revisión desde
+  cero y confirmó `APPROVED` de forma genuinamente independiente.
+
+## Sesión — feature 2 (config) — 2026-09-18
+
+**Estado final:** `done` (aprobada, ver `progress/review_2.md`).
+
+- `Cargo.toml`: añadidas dependencias `secrecy = "0.10.3"` (redacción de
+  secretos) y `thiserror = "2.0"` (errores tipados).
+- `src/config.rs`: `Config::from_env()` lee `DATABASE_URL`, `HTTP_HOST`,
+  `HTTP_PORT` y `GATEWAY_SHARED_SECRET` desde variables de entorno; una
+  variable faltante o un puerto inválido produce `ConfigError` (thiserror,
+  variantes `MissingVar`/`InvalidPort`) en vez de panic. La credencial de
+  servicio Gateway↔ms-usuarios se guarda como `secrecy::SecretString`, y
+  `Config` implementa `Debug` manualmente para garantizar que el secreto
+  real nunca aparece en un `{:?}`.
+- 4 tests unitarios: carga válida, variable faltante, puerto inválido, y
+  verificación explícita de que el `Debug` de `Config` no filtra el
+  secreto.
+- No se tocó lógica de otras features (`domain`, `repository`, `audit`,
+  `api` siguen como stubs de la feature 1).
+- `./init.sh` en verde (fmt, clippy, tests, doc).
+- Revisión: `reviewer` independiente lanzado por el líder, veredicto
+  `APPROVED` en `progress/review_2.md` (sin cambios requeridos; se anotó
+  como pendiente no bloqueante que el líder añadiera esta entrada de
+  historial al cerrar la sesión, lo cual se hace aquí).
