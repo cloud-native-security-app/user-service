@@ -219,3 +219,49 @@ la sesión que implemente la feature 1 (`scaffolding`)._
   (ownership de `PATCH`), segunda ronda `APPROVED` tras el fix, confirmando
   el `403`/`404`/`200` correctos y el test de dos identidades. Veredicto
   final en `progress/review_6.md`.
+
+## Sesión — feature 7 (service_wiring) — 2026-09-18
+
+**Estado final:** `done` (aprobada, ver `progress/review_7.md`).
+
+- Decisión de arquitectura escalada al usuario y resuelta: `Config` (feature
+  2) ganó un campo opcional `migrations_database_url`
+  (`MIGRATIONS_DATABASE_URL`, con fallback a `database_url` si está
+  ausente) para separar el rol que migra el esquema (dueño de las tablas,
+  necesario para crear el rol `ms_usuarios_app` y aplicar el
+  `REVOKE`/`GRANT` de `audit_log`) del rol que sirve tráfico HTTP real en
+  producción (`ms_usuarios_app`, restringido) — sin esta separación, el
+  `REVOKE` de la feature 4 solo habría tenido efecto en los tests, nunca en
+  producción.
+- `src/wiring.rs` (nuevo, composition root): `build_router(&Config)` aplica
+  `sqlx::migrate!` con el pool de `migrations_database_url`, construye por
+  separado el pool de `database_url` para `Repository`, y ensambla
+  `api::router(...)` + `GET /health` (fuera del middleware de auth, con un
+  `SELECT 1` real que responde `503` si Postgres no está disponible, nunca
+  solo "proceso vivo"). `WiringError` (thiserror) nunca expone el error
+  crudo de `sqlx` (que podría contener la connection string con
+  usuario/contraseña) — mensajes estáticos, sin interpolación.
+- `src/lib.rs`: `run()` deja de ser un stub — orquesta `Config::from_env()`
+  → `wiring::build_router` → bind TCP → `axum::serve`; un fallo en
+  cualquier paso (config inválida, Postgres inalcanzable, migración
+  fallida, bind del puerto) impide que el proceso llegue a servir tráfico a
+  medias.
+- `tests/service_wiring.rs` (nuevo, `#[ignore = "requiere Docker"]`): test
+  end-to-end real — bind real a `127.0.0.1:0`, `axum::serve` en background,
+  ejercido vía `reqwest` con el flujo completo `PUT /users/me` → `POST
+  /users/me/scans` → `GET /users/me/scans` → `GET /users/me/audit`, más un
+  test de que `GET /health` responde `200` sin ningún header de
+  autenticación.
+- `tests/scaffolding.rs` (heredado de la feature 1): actualizado para
+  reflejar que `run()` ya no es un stub sin efectos — ahora confirma que,
+  sin configuración, `run()` devuelve `RunError::Config` en vez de
+  panicar. El reviewer confirmó que este cambio es scope legítimo de esta
+  feature.
+- `Cargo.toml`: añadido `reqwest` (rustls-tls) como dev-dependency.
+- `./init.sh` completo en verde, incluyendo `cargo test -- --ignored`
+  contra Docker real, sin regresión en las features 4, 5 y 6.
+- Revisión: `reviewer` independiente confirmó específicamente la ausencia
+  de fuga de credenciales de base de datos en `WiringError`/logs, la
+  separación real de los dos pools, y que el health check hace una
+  comprobación real de conectividad. Veredicto `APPROVED` en
+  `progress/review_7.md`.

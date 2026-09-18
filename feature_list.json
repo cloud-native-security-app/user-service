@@ -110,7 +110,7 @@
         "Un test de integración end-to-end (#[ignore = \"requiere Docker\"]) levanta el servicio real sobre un Postgres de test y ejerce el flujo completo: crear perfil -> registrar escaneo -> consultar histórico -> consultar auditoría, todo vía HTTP real (no llamando a los handlers como funciones sueltas)",
         "Un fallo de Postgres al arrancar (migraciones o conexión) se reporta con un error explícito y el proceso no arranca a medias"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 8,

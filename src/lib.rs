@@ -18,36 +18,50 @@ pub mod audit;
 pub mod config;
 pub mod domain;
 pub mod repository;
+pub mod wiring;
 
 /// Arranca el servicio `ms-usuarios`.
 ///
-/// Composition root del servicio: en su forma final construirá la
-/// configuración, el pool de conexión a Postgres y el router `axum`, y
-/// pondrá el servidor HTTP a escuchar (ver feature `service_wiring`).
+/// Composition root del servicio: carga la [`config::Config`] desde
+/// variables de entorno, delega en [`wiring::build_router`] la aplicación
+/// de migraciones y el ensamblado del router `axum` completo (perfil,
+/// histórico, auditoría y `GET /health`), y pone el servidor HTTP a
+/// escuchar en `Config::http_host`/`Config::http_port`.
 ///
-/// Por ahora es un stub sin efectos: existe únicamente para que
-/// `src/main.rs` tenga un punto de entrada estable de la biblioteca desde
-/// el scaffolding inicial.
+/// Un fallo en cualquiera de esos pasos (configuración inválida, Postgres
+/// inalcanzable, migraciones fallidas, o el propio bind del puerto) se
+/// reporta como un [`RunError`] explícito — el proceso nunca queda
+/// sirviendo tráfico a medio inicializar.
 ///
 /// # Errores
 ///
-/// Devuelve `Err` si la orquestación real (aún no implementada) falla al
-/// construir sus dependencias.
+/// Ver [`RunError`] para el detalle de cada causa posible.
 pub async fn run() -> Result<(), RunError> {
-    Ok(())
+    let config = config::Config::from_env()?;
+    let app = wiring::build_router(&config).await?;
+
+    let listener = tokio::net::TcpListener::bind((config.http_host.as_str(), config.http_port))
+        .await
+        .map_err(RunError::Bind)?;
+
+    axum::serve(listener, app).await.map_err(RunError::Serve)
 }
 
 /// Error devuelto por [`run`] cuando el servicio no puede arrancar.
-///
-/// Sin variantes por ahora: se completará en la feature `service_wiring`
-/// cuando `run` orqueste `config`, `repository` y `api` de verdad.
-#[derive(Debug)]
-pub enum RunError {}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// La configuración del servicio no pudo cargarse desde variables de
+    /// entorno.
+    #[error("no se pudo cargar la configuración: {0}")]
+    Config(#[from] config::ConfigError),
+    /// La inicialización de la capa de persistencia (migraciones o pool de
+    /// aplicación) falló.
+    #[error("no se pudo inicializar la base de datos: {0}")]
+    Wiring(#[from] wiring::WiringError),
+    /// El servidor HTTP no pudo hacer bind del host/puerto configurado.
+    #[error("no se pudo hacer bind del servidor HTTP: {0}")]
+    Bind(std::io::Error),
+    /// El servidor HTTP terminó con un error durante su ejecución.
+    #[error("el servidor HTTP terminó con un error: {0}")]
+    Serve(std::io::Error),
 }
-
-impl std::error::Error for RunError {}

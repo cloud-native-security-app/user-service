@@ -19,28 +19,19 @@ _Se registra en tiempo real mientras se trabaja._
 
 _Si la sesión se interrumpe, lo primero que debe hacer la siguiente sesión._
 
-## Nota heredada para `service_wiring` (feature id 7)
+## Nota heredada para `containerization` (feature id 8)
 
-`progress/explore_audit_log_permissions.md` (pregunta abierta 3) y la
-migración `migrations/20260918120100_lock_audit_log_permissions.sql` dejan
-sin resolver con qué rol se aplican las migraciones en producción: el rol
-de aplicación `ms_usuarios_app` no es dueño de las tablas (por diseño, para
-que el `REVOKE` sobre `audit_log` tenga efecto real) y por tanto no puede
-migrar el esquema por sí mismo. Cuando se implemente `service_wiring`, hay
-que decidir explícitamente si las migraciones de producción corren con un
-rol migrador separado y un paso de despliegue distinto del arranque del
-binario, o alguna otra estrategia — no asumirlo implícitamente.
-
-`api::router(repository: Repository, gateway_shared_secret: SecretString) -> axum::Router`
-(feature 5, extendido por la feature 6 con las rutas de `/users/me/scans`,
-`/scans/{scan_id}` y `/users/me/audit` bajo el mismo middleware) queda listo
-para que `service_wiring` lo ensamble con el `Config`/pool reales — no hace
-falta ensamblar nada extra por separado.
-
-Precedente de diseño para futuras rutas con un identificador en la URL:
-`PATCH /scans/{scan_id}` (feature 6) tuvo que corregirse porque exigía la
-identidad del Gateway sin usarla para autorizar — cualquier handler nuevo
-que reciba un identificador en la URL (no solo `/users/me/...`) debe
-verificar ownership contra la identidad del header y responder `403` si no
-coincide, `docs/security-scope.md` §"Autorización a nivel de fila" no se
-limita al ejemplo `/users/{id}`.
+`Config` (features 2 y 7) ahora carga 5 variables de entorno:
+`DATABASE_URL`, `HTTP_HOST`, `HTTP_PORT`, `GATEWAY_SHARED_SECRET`
+(requeridas) y `MIGRATIONS_DATABASE_URL` (opcional, cae de vuelta a
+`DATABASE_URL` si está ausente). El acceptance de la feature 8 pide
+documentar en el README las env vars requeridas para `docker run` — las 5
+deben quedar documentadas, incluyendo que `MIGRATIONS_DATABASE_URL` es
+opcional y para qué sirve (separar el rol que migra el esquema, dueño de
+las tablas, del rol `ms_usuarios_app` que sirve tráfico real, para que el
+`REVOKE` sobre `audit_log` de la feature `postgres_persistence` tenga
+efecto real en producción). El aprovisionamiento concreto de esos dos
+roles/credenciales en un entorno de despliegue real queda fuera del
+alcance de este repo (es infraestructura/Terraform/DBA), pero el README sí
+debe explicar la distinción para que quien despliegue la imagen no la pase
+por alto.

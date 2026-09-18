@@ -24,6 +24,12 @@ const HTTP_PORT_VAR: &str = "HTTP_PORT";
 /// autentica la llamada Gateway→`ms-usuarios` (ver `docs/security-scope.md`).
 const GATEWAY_SHARED_SECRET_VAR: &str = "GATEWAY_SHARED_SECRET";
 
+/// Nombre de la variable de entorno, **opcional**, con la URL de conexión
+/// usada exclusivamente para aplicar migraciones (ver
+/// [`Config::migrations_database_url`]). Si está ausente, se usa el mismo
+/// valor que `DATABASE_URL`.
+const MIGRATIONS_DATABASE_URL_VAR: &str = "MIGRATIONS_DATABASE_URL";
+
 /// Configuración del servicio `ms-usuarios`, cargada desde variables de
 /// entorno mediante [`Config::from_env`].
 ///
@@ -41,6 +47,16 @@ pub struct Config {
     /// Credencial compartida que autentica al Gateway como llamante de este
     /// servicio (ver `docs/security-scope.md`). Redactada en `Debug`.
     pub gateway_shared_secret: SecretString,
+    /// URL de conexión a PostgreSQL usada exclusivamente para aplicar
+    /// migraciones (`sqlx::migrate!`), con el rol "dueño" de las tablas —
+    /// distinto en producción del rol de aplicación `ms_usuarios_app` que
+    /// usa `database_url` para servir tráfico HTTP (ver
+    /// `migrations/20260918120100_lock_audit_log_permissions.sql`: el dueño
+    /// de una tabla se salta cualquier `REVOKE`, así que ese rol no debe
+    /// servir tráfico en producción). Si `MIGRATIONS_DATABASE_URL` no está
+    /// presente en el entorno, cae de vuelta al valor de `database_url`
+    /// (para dev/test con un único rol todopoderoso).
+    pub migrations_database_url: String,
 }
 
 impl fmt::Debug for Config {
@@ -54,6 +70,7 @@ impl fmt::Debug for Config {
             .field("http_host", &self.http_host)
             .field("http_port", &self.http_port)
             .field("gateway_shared_secret", &self.gateway_shared_secret)
+            .field("migrations_database_url", &self.migrations_database_url)
             .finish()
     }
 }
@@ -62,7 +79,9 @@ impl Config {
     /// Carga la configuración del servicio desde variables de entorno.
     ///
     /// Variables requeridas: `DATABASE_URL`, `HTTP_HOST`, `HTTP_PORT` y
-    /// `GATEWAY_SHARED_SECRET`.
+    /// `GATEWAY_SHARED_SECRET`. `MIGRATIONS_DATABASE_URL` es **opcional**:
+    /// si está ausente, [`Config::migrations_database_url`] cae de vuelta al
+    /// valor de `DATABASE_URL`.
     ///
     /// # Errores
     ///
@@ -74,6 +93,8 @@ impl Config {
         let http_host = read_required(HTTP_HOST_VAR)?;
         let raw_http_port = read_required(HTTP_PORT_VAR)?;
         let gateway_shared_secret = SecretString::from(read_required(GATEWAY_SHARED_SECRET_VAR)?);
+        let migrations_database_url =
+            std::env::var(MIGRATIONS_DATABASE_URL_VAR).unwrap_or_else(|_| database_url.clone());
 
         let http_port = raw_http_port
             .parse::<u16>()
@@ -86,6 +107,7 @@ impl Config {
             http_host,
             http_port,
             gateway_shared_secret,
+            migrations_database_url,
         })
     }
 }
@@ -160,6 +182,7 @@ mod tests {
                 std::env::remove_var(HTTP_HOST_VAR);
                 std::env::remove_var(HTTP_PORT_VAR);
                 std::env::remove_var(GATEWAY_SHARED_SECRET_VAR);
+                std::env::remove_var(MIGRATIONS_DATABASE_URL_VAR);
             }
         }
     }
@@ -220,6 +243,39 @@ mod tests {
                 variable: HTTP_PORT_VAR
             })
         ));
+
+        drop(guard);
+    }
+
+    #[test]
+    fn from_env_loads_migrations_database_url_when_present() {
+        let guard = EnvGuard::set_valid_env();
+        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
+        unsafe {
+            std::env::set_var(
+                MIGRATIONS_DATABASE_URL_VAR,
+                "postgres://migrator:pass@localhost/db",
+            );
+        }
+
+        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+
+        assert_eq!(
+            config.migrations_database_url,
+            "postgres://migrator:pass@localhost/db"
+        );
+        assert_eq!(config.database_url, "postgres://user:pass@localhost/db");
+
+        drop(guard);
+    }
+
+    #[test]
+    fn from_env_falls_back_to_database_url_when_migrations_database_url_is_absent() {
+        let guard = EnvGuard::set_valid_env();
+
+        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+
+        assert_eq!(config.migrations_database_url, config.database_url);
 
         drop(guard);
     }
