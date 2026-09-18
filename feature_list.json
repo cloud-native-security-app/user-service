@@ -56,6 +56,7 @@
       "name": "postgres_persistence",
       "title": "Persistencia en PostgreSQL (db-usuarios)",
       "description": "Migraciones versionadas y repositorio sqlx para perfiles, histórico de escaneos y auditoría. La tabla de auditoría se refuerza a nivel de base de datos para que solo admita INSERT/SELECT.",
+      "status": "done",
       "acceptance": [
         "migrations/ contiene migraciones sqlx versionadas que crean las tablas users, scan_history y audit_log, con las claves foráneas correspondientes (scan_history.user_id -> users, audit_log.user_id -> users)",
         "Una migración crea un rol/grant de base de datos (o revoca privilegios del rol de aplicación) tal que audit_log solo admite INSERT y SELECT — un intento de UPDATE/DELETE contra esa tabla con el rol de aplicación falla por permisos, no por lógica de la aplicación",
@@ -65,8 +66,7 @@
         "Un id/usuario inexistente en una consulta devuelve Ok(None) o Vec vacío, nunca un error",
         "Fallos de conexión a Postgres son un RepoError distinguible, no un panic",
         "Tests de integración corren contra el contenedor PostgreSQL oficial levantado vía testcontainers (migraciones aplicadas al arrancar), marcados #[ignore = \"requiere Docker\"]: upsert+find de usuario, insert+list de histórico, transición de estado, append+lectura de auditoría, y el intento explícito de UPDATE/DELETE directo sobre audit_log que debe fallar por permisos"
-      ],
-      "status": "pending"
+      ]
     },
     {
       "id": 5,

@@ -91,3 +91,55 @@ la sesión que implemente la feature 1 (`scaffolding`)._
 - `./init.sh` en verde (fmt, clippy, tests, doc).
 - Revisión: `reviewer` independiente lanzado por el líder, veredicto
   `APPROVED` en `progress/review_3.md`.
+
+## Sesión — feature 4 (postgres_persistence) — 2026-09-18
+
+**Estado final:** `done` (aprobada, ver `progress/review_4.md`).
+
+- Investigación previa: el líder lanzó dos exploradores en paralelo
+  (`progress/explore_testcontainers_postgres.md`,
+  `progress/explore_audit_log_permissions.md`) para resolver de antemano dos
+  problemas difíciles: cómo levantar Postgres con `testcontainers-modules` +
+  aplicar migraciones `sqlx` en tests, y cómo diseñar el refuerzo de
+  permisos de `audit_log` a nivel de rol de base de datos sin que el test
+  fuera un falso positivo (el dueño de una tabla se salta cualquier
+  `REVOKE`).
+- `migrations/20260918120000_create_core_schema.sql`: tablas `users`,
+  `scan_history`, `audit_log` con FKs (`scan_history.user_id -> users`,
+  `audit_log.user_id -> users`), `status` como `TEXT` + `CHECK` alineado con
+  el encoding `SCREAMING_SNAKE_CASE` de `ScanStatus`.
+- `migrations/20260918120100_lock_audit_log_permissions.sql`: crea
+  (idempotentemente) el rol `ms_usuarios_app` en `NOLOGIN` sin contraseña
+  embebida, revoca todo de `PUBLIC` y del propio rol, y concede
+  `SELECT, INSERT, UPDATE` en `users`/`scan_history` pero **solo
+  `SELECT, INSERT`** en `audit_log` — nunca `UPDATE`/`DELETE`.
+- `src/repository.rs`: `Repository { pool: PgPool }` con `upsert_user`,
+  `find_user`, `insert_scan_history`, `update_scan_status`,
+  `list_scan_history`, `append_audit_entry` y `RepoError` (`thiserror`,
+  `From<sqlx::Error>`) — sin ningún método mutador para `audit_log`; un
+  id/usuario inexistente devuelve `Ok(None)`/`Vec` vacío, nunca error;
+  fallos de conexión son `RepoError` distinguible, nunca panic.
+- `tests/repository.rs`: 9 tests `#[ignore = "requiere Docker"]` contra
+  Postgres real vía `testcontainers-modules` (pool superusuario para migrar
+  y fixtures, pool del rol `ms_usuarios_app` con login activado en runtime
+  para ejercer el repositorio real): upsert+find, conflicto de upsert,
+  insert+list de histórico, transición de estado, `update_scan_status`
+  sobre id inexistente, append+lectura de auditoría, y el test explícito de
+  que `UPDATE`/`DELETE` contra `audit_log` con el pool del rol de
+  aplicación falla con SQLSTATE `42501` — con control positivo de que
+  `SELECT`/`INSERT` sí funcionan con ese mismo rol.
+- `Cargo.toml`: `testcontainers` subido a `0.27`, añadido
+  `testcontainers-modules` (feature `postgres`), añadida la feature
+  `chrono` a `sqlx`.
+- Alcance: no se tocó `src/config.rs` (sigue con una sola `database_url`);
+  `Repository` recibe el `PgPool` ya construido por el llamante. Queda
+  anotado para la feature `service_wiring` (id 7): con qué rol se aplican
+  las migraciones en producción, dado que el rol de aplicación no es dueño
+  de las tablas y no podría migrar el esquema por sí mismo.
+- `./init.sh` completo en verde, incluyendo `cargo test -- --ignored` (9/9)
+  contra Docker real.
+- Revisión: `reviewer` independiente lanzado por el líder verificó
+  específicamente que no hay ruta de fuga (ownership, herencia, `PUBLIC` no
+  revocado) por la que `ms_usuarios_app` pudiera mutar `audit_log`, y
+  re-ejecutó los tests de integración contra Docker real. Veredicto
+  `APPROVED` en `progress/review_4.md`.
