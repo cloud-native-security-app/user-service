@@ -179,3 +179,43 @@ la sesión que implemente la feature 1 (`scaffolding`)._
   real de validación (credencial antes que identidad, ambas antes que la
   DB) y la ausencia de fuga de datos personales en errores/logs. Veredicto
   `APPROVED` en `progress/review_5.md`.
+
+## Sesión — feature 6 (scan_history_api) — 2026-09-18
+
+**Estado final:** `done` (aprobada tras una ronda de correcciones, ver
+`progress/review_6.md`).
+
+- `src/repository.rs`: nuevos métodos `record_scan_request(entry,
+  audit_entry)` (transacción atómica real vía `pool.begin()`/`tx.commit()`:
+  inserta `scan_history` + `audit_log` en la misma transacción; si el
+  `INSERT` de auditoría falla, el histórico queda revertido — verificado con
+  un test que provoca una violación real de FK y confirma que la fila de
+  `scan_history` no persiste), `list_audit_entries(user_id)`, y
+  `find_scan_owner(scan_id)` (añadido en la ronda de corrección, ver abajo).
+- `src/api.rs`: 4 rutas nuevas bajo el mismo middleware
+  `require_gateway_and_identity` de la feature 5 — `POST /users/me/scans`
+  (`scan_id`/`id` de auditoría generados por el servicio vía `Uuid::new_v4()`,
+  nunca por el cliente), `PATCH /scans/{scan_id}` (actualiza estado, `404`
+  si no existe), `GET /users/me/scans` y `GET /users/me/audit` (filtran
+  estrictamente por el `user_id` del header, probado con dos identidades
+  distintas).
+- `Cargo.toml`: añadida dependencia `uuid` (feature `v4`).
+- **Ronda de corrección:** la primera revisión (`CHANGES_REQUESTED`) detectó
+  que `PATCH /scans/{scan_id}` exigía el header de identidad pero lo
+  descartaba sin usarlo para autorizar — con la credencial de servicio
+  válida y cualquier identidad no vacía se podía mutar el estado de un
+  escaneo de **otro** usuario, violando la autorización a nivel de fila de
+  `docs/security-scope.md`. El líder escaló la decisión de diseño al
+  usuario (verificar ownership con `403` vs. tratar la ruta como
+  service-to-service sin identidad de usuario); el usuario eligió verificar
+  ownership. Se añadió `find_scan_owner` y la comparación contra la
+  identidad del header (`403` si no coincide, `404` si el `scan_id` no
+  existe, `200`/`204` si coincide), con un test de dos identidades que
+  confirma el rechazo y que el estado no cambió tras el intento.
+- `./init.sh` completo en verde, incluyendo `cargo test -- --ignored`
+  contra Docker real, sin regresión en las features 4 y 5 ni en el resto de
+  tests de la propia feature 6.
+- Revisión: `reviewer` independiente — primera ronda `CHANGES_REQUESTED`
+  (ownership de `PATCH`), segunda ronda `APPROVED` tras el fix, confirmando
+  el `403`/`404`/`200` correctos y el test de dos identidades. Veredicto
+  final en `progress/review_6.md`.

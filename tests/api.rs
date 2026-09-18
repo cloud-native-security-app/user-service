@@ -118,7 +118,17 @@ fn request_with_headers(
     secret: Option<&str>,
     body: Body,
 ) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri("/users/me");
+    request_to_with_headers(method, "/users/me", identity, secret, body)
+}
+
+fn request_to_with_headers(
+    method: &str,
+    uri: &str,
+    identity: Option<&str>,
+    secret: Option<&str>,
+    body: Body,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
     if let Some(secret) = secret {
         builder = builder.header(GATEWAY_SECRET_HEADER, secret);
     }
@@ -333,4 +343,321 @@ async fn a_user_cannot_read_another_users_profile_via_get() {
         StatusCode::NOT_FOUND,
         "el llamante 'someone-else' no tiene perfil propio, así que nunca debe ver el de 'owner-user'"
     );
+}
+
+async fn create_profile(router: &Router, user_id: &str) {
+    let request = request_with_headers(
+        "PUT",
+        Some(user_id),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(
+            json!({"email": format!("{user_id}@example.test"), "display_name": "Test User"})
+                .to_string(),
+        ),
+    );
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("la creación del perfil no debe fallar a nivel de transporte");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn post_scan_creates_history_and_audit_entry_atomically() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    create_profile(&router, "scan-owner").await;
+
+    let create_request = request_to_with_headers(
+        "POST",
+        "/users/me/scans",
+        Some("scan-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"target": "192.0.2.50"}).to_string()),
+    );
+    let create_response = router
+        .clone()
+        .oneshot(create_request)
+        .await
+        .expect("la petición POST no debe fallar a nivel de transporte");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let created = body_json(create_response).await;
+    assert_eq!(created["user_id"], "scan-owner");
+    assert_eq!(created["target"], "192.0.2.50");
+    assert_eq!(created["status"], "PENDIENTE");
+    let scan_id = created["scan_id"]
+        .as_str()
+        .expect("scan_id debe ser un string generado por el servicio")
+        .to_string();
+    assert!(!scan_id.is_empty());
+
+    let history_request = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some("scan-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let history_response = router
+        .clone()
+        .oneshot(history_request)
+        .await
+        .expect("GET histórico no debe fallar a nivel de transporte");
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let history = body_json(history_response).await;
+    let history = history.as_array().expect("histórico debe ser un array");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["scan_id"], scan_id);
+    assert_eq!(history[0]["status"], "PENDIENTE");
+
+    let audit_request = request_to_with_headers(
+        "GET",
+        "/users/me/audit",
+        Some("scan-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let audit_response = router
+        .oneshot(audit_request)
+        .await
+        .expect("GET auditoría no debe fallar a nivel de transporte");
+    assert_eq!(audit_response.status(), StatusCode::OK);
+    let audit = body_json(audit_response).await;
+    let audit = audit.as_array().expect("auditoría debe ser un array");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["target"], "192.0.2.50");
+    assert_eq!(audit[0]["user_id"], "scan-owner");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_scan_status_update_is_reflected_in_get_history() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    create_profile(&router, "scan-patch-owner").await;
+
+    let create_request = request_to_with_headers(
+        "POST",
+        "/users/me/scans",
+        Some("scan-patch-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"target": "192.0.2.60"}).to_string()),
+    );
+    let create_response = router
+        .clone()
+        .oneshot(create_request)
+        .await
+        .expect("POST no debe fallar a nivel de transporte");
+    let created = body_json(create_response).await;
+    let scan_id = created["scan_id"].as_str().unwrap().to_string();
+
+    let patch_request = request_to_with_headers(
+        "PATCH",
+        &format!("/scans/{scan_id}"),
+        Some("scan-patch-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"status": "COMPLETADO"}).to_string()),
+    );
+    let patch_response = router
+        .clone()
+        .oneshot(patch_request)
+        .await
+        .expect("PATCH no debe fallar a nivel de transporte");
+    assert_eq!(patch_response.status(), StatusCode::NO_CONTENT);
+
+    let history_request = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some("scan-patch-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let history_response = router
+        .oneshot(history_request)
+        .await
+        .expect("GET histórico no debe fallar a nivel de transporte");
+    let history = body_json(history_response).await;
+    let history = history.as_array().expect("histórico debe ser un array");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["scan_id"], scan_id);
+    assert_eq!(history[0]["status"], "COMPLETADO");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_scan_status_returns_404_for_unknown_scan_id() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let patch_request = request_to_with_headers(
+        "PATCH",
+        "/scans/no-existe",
+        Some("someone"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"status": "COMPLETADO"}).to_string()),
+    );
+    let response = router
+        .oneshot(patch_request)
+        .await
+        .expect("PATCH no debe fallar a nivel de transporte");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_user_cannot_patch_another_users_scan_status() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    create_profile(&router, "patch-owner").await;
+    create_profile(&router, "patch-intruder").await;
+
+    let create_request = request_to_with_headers(
+        "POST",
+        "/users/me/scans",
+        Some("patch-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"target": "192.0.2.80"}).to_string()),
+    );
+    let create_response = router
+        .clone()
+        .oneshot(create_request)
+        .await
+        .expect("POST no debe fallar a nivel de transporte");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let created = body_json(create_response).await;
+    let scan_id = created["scan_id"].as_str().unwrap().to_string();
+
+    let patch_as_intruder = request_to_with_headers(
+        "PATCH",
+        &format!("/scans/{scan_id}"),
+        Some("patch-intruder"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"status": "COMPLETADO"}).to_string()),
+    );
+    let patch_response = router
+        .clone()
+        .oneshot(patch_as_intruder)
+        .await
+        .expect("PATCH no debe fallar a nivel de transporte");
+    assert_eq!(
+        patch_response.status(),
+        StatusCode::FORBIDDEN,
+        "'patch-intruder' no es dueño de este scan_id, así que nunca debe poder mutarlo"
+    );
+
+    let history_as_owner = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some("patch-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let history_response = router
+        .oneshot(history_as_owner)
+        .await
+        .expect("GET histórico no debe fallar a nivel de transporte");
+    let history = body_json(history_response).await;
+    let history = history.as_array().expect("histórico debe ser un array");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0]["status"], "PENDIENTE",
+        "el intento de PATCH rechazado no debe haber mutado el estado del escaneo"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_user_cannot_read_another_users_scan_history_or_audit() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    create_profile(&router, "history-owner").await;
+    create_profile(&router, "history-intruder").await;
+
+    let create_request = request_to_with_headers(
+        "POST",
+        "/users/me/scans",
+        Some("history-owner"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"target": "192.0.2.70"}).to_string()),
+    );
+    let create_response = router
+        .clone()
+        .oneshot(create_request)
+        .await
+        .expect("POST no debe fallar a nivel de transporte");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let history_as_intruder = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some("history-intruder"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let history_response = router
+        .clone()
+        .oneshot(history_as_intruder)
+        .await
+        .expect("GET histórico no debe fallar a nivel de transporte");
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let history = body_json(history_response).await;
+    assert!(
+        history.as_array().expect("debe ser un array").is_empty(),
+        "'history-intruder' nunca debe ver el histórico de 'history-owner'"
+    );
+
+    let audit_as_intruder = request_to_with_headers(
+        "GET",
+        "/users/me/audit",
+        Some("history-intruder"),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let audit_response = router
+        .oneshot(audit_as_intruder)
+        .await
+        .expect("GET auditoría no debe fallar a nivel de transporte");
+    assert_eq!(audit_response.status(), StatusCode::OK);
+    let audit = body_json(audit_response).await;
+    assert!(
+        audit.as_array().expect("debe ser un array").is_empty(),
+        "'history-intruder' nunca debe ver la auditoría de 'history-owner'"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn scan_routes_require_gateway_secret_and_identity_header() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let missing_secret = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some("someone"),
+        None,
+        Body::empty(),
+    );
+    let response = router
+        .clone()
+        .oneshot(missing_secret)
+        .await
+        .expect("la petición no debe fallar a nivel de transporte");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_identity = request_to_with_headers(
+        "GET",
+        "/users/me/audit",
+        None,
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let response = router
+        .oneshot(missing_identity)
+        .await
+        .expect("la petición no debe fallar a nivel de transporte");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

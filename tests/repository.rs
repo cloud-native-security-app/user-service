@@ -358,6 +358,137 @@ async fn update_and_delete_against_audit_log_fail_by_permissions_for_the_app_rol
     );
 }
 
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn record_scan_request_persists_history_and_audit_atomically() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone());
+    let profile = sample_profile("test-user-8");
+    repo.upsert_user(&profile)
+        .await
+        .expect("el usuario debe crearse antes de registrar un escaneo (FK)");
+
+    let entry = sample_scan("scan-8", &profile.user_id, ScanStatus::Pendiente);
+    let audit_entry = AuditEntry::new(
+        "audit-8",
+        &profile.user_id,
+        &entry.target,
+        "scan_requested",
+        entry.requested_at,
+    );
+
+    repo.record_scan_request(&entry, &audit_entry)
+        .await
+        .expect("record_scan_request no debe fallar cuando ambas escrituras son válidas");
+
+    let history = repo
+        .list_scan_history(&profile.user_id)
+        .await
+        .expect("list_scan_history no debe fallar");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].scan_id, entry.scan_id);
+
+    let audit = repo
+        .list_audit_entries(&profile.user_id)
+        .await
+        .expect("list_audit_entries no debe fallar");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].id(), "audit-8");
+    assert_eq!(audit[0].target(), entry.target);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn record_scan_request_rolls_back_history_when_audit_insert_fails() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone());
+    let profile = sample_profile("test-user-9");
+    repo.upsert_user(&profile)
+        .await
+        .expect("el usuario debe crearse antes de registrar un escaneo (FK)");
+
+    let entry = sample_scan("scan-9", &profile.user_id, ScanStatus::Pendiente);
+    // `user_id` inexistente: viola la FK de audit_log hacia users, así que
+    // el INSERT de auditoría debe fallar y, con él, revertirse también el
+    // INSERT de scan_history dentro de la misma transacción.
+    let audit_entry = AuditEntry::new(
+        "audit-9",
+        "no-existe-como-usuario",
+        &entry.target,
+        "scan_requested",
+        entry.requested_at,
+    );
+
+    let result = repo.record_scan_request(&entry, &audit_entry).await;
+    assert!(
+        result.is_err(),
+        "se esperaba que record_scan_request fallara por la violación de FK en audit_log"
+    );
+
+    let history = repo
+        .list_scan_history(&profile.user_id)
+        .await
+        .expect("list_scan_history no debe fallar");
+    assert!(
+        history.is_empty(),
+        "el histórico no debe quedar persistido si la auditoría falló: la transacción debió revertirse"
+    );
+
+    let audit = repo
+        .list_audit_entries(&profile.user_id)
+        .await
+        .expect("list_audit_entries no debe fallar");
+    assert!(audit.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn list_audit_entries_returns_empty_vec_for_user_without_entries() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone());
+    let profile = sample_profile("test-user-10");
+    repo.upsert_user(&profile)
+        .await
+        .expect("el usuario debe crearse");
+
+    let audit = repo
+        .list_audit_entries(&profile.user_id)
+        .await
+        .expect("list_audit_entries no debe fallar");
+
+    assert!(audit.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn list_audit_entries_does_not_return_another_users_entries() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone());
+    let owner = sample_profile("test-user-11-owner");
+    let other = sample_profile("test-user-11-other");
+    repo.upsert_user(&owner).await.expect("owner debe crearse");
+    repo.upsert_user(&other).await.expect("other debe crearse");
+
+    let entry = sample_scan("scan-11", &owner.user_id, ScanStatus::Pendiente);
+    let audit_entry = AuditEntry::new(
+        "audit-11",
+        &owner.user_id,
+        &entry.target,
+        "scan_requested",
+        entry.requested_at,
+    );
+    repo.record_scan_request(&entry, &audit_entry)
+        .await
+        .expect("record_scan_request no debe fallar");
+
+    let other_audit = repo
+        .list_audit_entries(&other.user_id)
+        .await
+        .expect("list_audit_entries no debe fallar");
+
+    assert!(other_audit.is_empty());
+}
+
 /// Verifica que `result` es un error de base de datos con SQLSTATE `42501`
 /// (`insufficient_privilege`) — nunca `Ok`, nunca otra variante de
 /// `sqlx::Error` (lo que indicaría que el fallo fue por otra razón, p. ej.

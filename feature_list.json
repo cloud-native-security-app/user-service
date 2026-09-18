@@ -96,7 +96,7 @@
         "Las mismas reglas de autorización por header de identidad + credencial de servicio de la feature user_profile_api aplican a todas las rutas de esta feature",
         "Tests de integración (#[ignore = \"requiere Docker\"]): registrar escaneo crea histórico + auditoría atómicamente; actualizar estado se refleja en GET /users/me/scans; scan_id inexistente en PATCH -> 404; un usuario no puede leer el histórico/auditoría de otro (probado con dos identidades distintas)"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 7,

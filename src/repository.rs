@@ -126,6 +126,28 @@ impl Repository {
         Ok(())
     }
 
+    /// Devuelve el `user_id` dueño de `scan_id`, para que el llamante
+    /// (`api::patch_scan_status`) pueda verificar autorización a nivel de
+    /// fila antes de mutar el estado del escaneo (ver
+    /// `docs/security-scope.md` §"Autorización a nivel de fila": un `id` que
+    /// no coincide con la identidad del llamante es `403`, no un `UPDATE`
+    /// que "por suerte" no afecta ninguna fila).
+    ///
+    /// Un `scan_id` inexistente devuelve `Ok(None)`, nunca un error.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
+    pub async fn find_scan_owner(&self, scan_id: &str) -> Result<Option<String>, RepoError> {
+        let owner: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM scan_history WHERE scan_id = $1")
+                .bind(scan_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(owner.map(|(user_id,)| user_id))
+    }
+
     /// Devuelve el histórico de escaneos de `user_id`, ordenado por fecha
     /// de solicitud ascendente.
     ///
@@ -180,6 +202,76 @@ impl Repository {
 
         Ok(())
     }
+
+    /// Registra, de forma atómica, una nueva entrada de histórico de
+    /// escaneo (RF-13) y su correspondiente entrada de auditoría (RF-15) —
+    /// ambos `INSERT` se ejecutan dentro de la misma transacción de base de
+    /// datos: si el `INSERT` de `scan_history` tiene éxito pero el de
+    /// `audit_log` falla (p. ej. porque `audit_entry.user_id()` viola la
+    /// clave foránea hacia `users`), la transacción se revierte por
+    /// completo y el histórico tampoco queda persistido.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError`] si cualquiera de los dos `INSERT` falla, o si
+    /// no se puede abrir/confirmar la transacción. Nunca hace `panic!`.
+    pub async fn record_scan_request(
+        &self,
+        entry: &ScanHistoryEntry,
+        audit_entry: &AuditEntry,
+    ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&entry.scan_id)
+        .bind(&entry.user_id)
+        .bind(&entry.target)
+        .bind(status_as_db_str(entry.status))
+        .bind(entry.requested_at)
+        .bind(entry.updated_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO audit_log (id, user_id, target, action, recorded_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(audit_entry.id())
+        .bind(audit_entry.user_id())
+        .bind(audit_entry.target())
+        .bind(audit_entry.action())
+        .bind(audit_entry.recorded_at())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Devuelve las entradas de auditoría (RF-15) originadas por
+    /// `user_id`, ordenadas por fecha de registro ascendente.
+    ///
+    /// Un `user_id` sin entradas (o inexistente) devuelve un `Vec` vacío,
+    /// nunca un error.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
+    pub async fn list_audit_entries(&self, user_id: &str) -> Result<Vec<AuditEntry>, RepoError> {
+        let rows = sqlx::query_as::<_, AuditRow>(
+            "SELECT id, user_id, target, action, recorded_at \
+             FROM audit_log WHERE user_id = $1 ORDER BY recorded_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(AuditEntry::from).collect())
+    }
 }
 
 /// Fila cruda de la tabla `users`, mapeada a [`UserProfile`] vía `From`.
@@ -227,6 +319,24 @@ impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
             requested_at: row.requested_at,
             updated_at: row.updated_at,
         })
+    }
+}
+
+/// Fila cruda de la tabla `audit_log`, mapeada a [`AuditEntry`] vía `From`
+/// (no hay estado que validar, a diferencia de `scan_history`, así que la
+/// conversión no puede fallar).
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    id: String,
+    user_id: String,
+    target: String,
+    action: String,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<AuditRow> for AuditEntry {
+    fn from(row: AuditRow) -> Self {
+        AuditEntry::new(row.id, row.user_id, row.target, row.action, row.recorded_at)
     }
 }
 
