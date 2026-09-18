@@ -1,0 +1,133 @@
+{
+  "project": "user-service",
+  "description": "Microservicio ms-usuarios: mantiene el perfil de cada usuario autenticado (identidad ya verificada por el Gateway vía Google OAuth2/OIDC), el histórico de escaneos que ha solicitado (RF-13) y el registro inmutable de auditoría de quién solicitó qué escaneo y cuándo (RF-15). Habla directo con el Gateway vía HTTP síncrono (no pasa por el Broker) y persiste en PostgreSQL (db-usuarios).",
+  "rules": {
+    "one_feature_at_a_time": true,
+    "require_tests_to_close": true,
+    "valid_status": ["pending", "in_progress", "done", "blocked"]
+  },
+  "features": [
+    {
+      "id": 1,
+      "name": "scaffolding",
+      "title": "Scaffolding del crate Rust",
+      "description": "Inicializar el crate Rust con tokio, axum, sqlx, tracing y la estructura de módulos base (lib + main delgado).",
+      "acceptance": [
+        "Existe Cargo.toml (edition 2021 o superior) con dependencias: tokio (rt-multi-thread, macros), axum, sqlx (postgres, runtime-tokio-rustls), tracing, tracing-subscriber, serde (derive), serde_json",
+        "El crate expone src/lib.rs con los módulos (config, domain, repository, audit, api) declarados pub, para que los tests de integración en tests/ puedan importarlos (tests/ compila como crate externo y no puede ver módulos de un binario puro)",
+        "src/main.rs es un envoltorio delgado: inicializa el runtime tokio y tracing_subscriber, y llama a una función pública de la lib (p. ej. lib::run()) para el resto de la lógica",
+        "src/lib.rs (o el módulo raíz) activa #![deny(missing_docs)] para forzar rustdoc en todo ítem público futuro",
+        "Cargo.toml incluye testcontainers como dev-dependency",
+        "Existe migrations/ (vacío o con un README) preparado para las migraciones de sqlx de la feature postgres_persistence",
+        "cargo build compila sin warnings"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 2,
+      "name": "config",
+      "title": "Configuración del servicio",
+      "description": "Carga y valida la configuración del servicio desde variables de entorno (Postgres, bind HTTP, credencial de servicio Gateway<->ms-usuarios).",
+      "acceptance": [
+        "src/config.rs carga configuración desde variables de entorno (URL de conexión a Postgres, host/puerto de bind del servidor HTTP, credencial compartida para autenticar al Gateway como llamante) y devuelve un error explícito si falta una variable requerida, sin panics",
+        "La credencial de servicio usa un tipo que redacta su contenido en Debug/Display (p. ej. secrecy::SecretString) para que no pueda filtrarse por accidente vía tracing::debug!/error! ni en un panic message",
+        "Ningún valor de configuración queda hardcodeado en el código",
+        "Test cubre: config válida se carga correctamente; falta una variable requerida produce un error tipado; Debug no filtra la credencial"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 3,
+      "name": "domain_model",
+      "title": "Modelo de dominio de usuarios, histórico y auditoría",
+      "description": "Tipos puros que representan el perfil de un usuario, una entrada de histórico de escaneo y una entrada de auditoría.",
+      "acceptance": [
+        "src/domain.rs define UserProfile { user_id (identidad reenviada por el Gateway, p. ej. el `sub` de Google), email, display_name, created_at }",
+        "src/domain.rs define ScanHistoryEntry { scan_id, user_id, target, status: ScanStatus, requested_at, updated_at }, con ScanStatus como enum (Pendiente, EnProgreso, Completado, Fallido) coincidiendo con los 4 estados de RF-07",
+        "src/domain.rs define AuditEntry { id, user_id, target, action, recorded_at } — append-only por diseño (sin ningún método que permita mutar una instancia ya construida más allá de sus campos privados)",
+        "Todos los tipos derivan Serialize/Deserialize (serde) para la API HTTP",
+        "Ningún tipo de este módulo permite construir una instancia con datos parcialmente inválidos silenciosamente (p. ej. un ScanStatus fuera de las 4 variantes no compila)",
+        "Test unitario cubre (de)serialización round-trip de cada tipo y el encoding estable de ScanStatus"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 4,
+      "name": "postgres_persistence",
+      "title": "Persistencia en PostgreSQL (db-usuarios)",
+      "description": "Migraciones versionadas y repositorio sqlx para perfiles, histórico de escaneos y auditoría. La tabla de auditoría se refuerza a nivel de base de datos para que solo admita INSERT/SELECT.",
+      "acceptance": [
+        "migrations/ contiene migraciones sqlx versionadas que crean las tablas users, scan_history y audit_log, con las claves foráneas correspondientes (scan_history.user_id -> users, audit_log.user_id -> users)",
+        "Una migración crea un rol/grant de base de datos (o revoca privilegios del rol de aplicación) tal que audit_log solo admite INSERT y SELECT — un intento de UPDATE/DELETE contra esa tabla con el rol de aplicación falla por permisos, no por lógica de la aplicación",
+        "src/repository.rs expone upsert_user(profile) -> Result<(), RepoError>, find_user(user_id) -> Result<Option<UserProfile>, RepoError>",
+        "src/repository.rs expone insert_scan_history(entry) -> Result<(), RepoError>, update_scan_status(scan_id, status) -> Result<(), RepoError>, list_scan_history(user_id) -> Result<Vec<ScanHistoryEntry>, RepoError>",
+        "src/repository.rs expone append_audit_entry(entry) -> Result<(), RepoError> — sin ningún método update/delete en la API pública del repositorio para audit_log",
+        "Un id/usuario inexistente en una consulta devuelve Ok(None) o Vec vacío, nunca un error",
+        "Fallos de conexión a Postgres son un RepoError distinguible, no un panic",
+        "Tests de integración corren contra el contenedor PostgreSQL oficial levantado vía testcontainers (migraciones aplicadas al arrancar), marcados #[ignore = \"requiere Docker\"]: upsert+find de usuario, insert+list de histórico, transición de estado, append+lectura de auditoría, y el intento explícito de UPDATE/DELETE directo sobre audit_log que debe fallar por permisos"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 5,
+      "name": "user_profile_api",
+      "title": "API HTTP: perfil de usuario",
+      "description": "Endpoints axum para crear/actualizar y consultar el perfil de un usuario, autorizados a nivel de fila contra la identidad reenviada por el Gateway.",
+      "acceptance": [
+        "src/api.rs (o un submódulo) expone PUT /users/me (upsert del perfil del llamante) y GET /users/me (perfil del llamante) usando axum",
+        "Cada handler exige un header de identidad reenviado por el Gateway (p. ej. X-Forwarded-User o equivalente, nombre exacto documentado en rustdoc) y lo usa como único origen de verdad de user_id — nunca confía en un user_id del cuerpo/query",
+        "Toda ruta exige además la credencial de servicio Gateway<->ms-usuarios (feature config); su ausencia o valor incorrecto responde 401 antes de tocar la base de datos",
+        "Ausencia del header de identidad responde 400/401 explícito, nunca un panic ni un 500 genérico",
+        "Ningún mensaje de error ni log de esta feature incluye el email o nombre del usuario (ver docs/security-scope.md)",
+        "Tests de integración (#[ignore = \"requiere Docker\"], contenedor Postgres real): upsert crea el perfil, GET posterior lo refleja, falta la credencial de servicio -> 401, falta el header de identidad -> 400/401"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 6,
+      "name": "scan_history_api",
+      "title": "API HTTP: histórico de escaneos y auditoría",
+      "description": "Endpoints axum para que el Gateway registre una nueva solicitud de escaneo, actualice su estado, y para que el usuario consulte su propio histórico (RF-13) y su propio registro de auditoría (RF-15).",
+      "acceptance": [
+        "POST /users/me/scans registra una nueva entrada de histórico (estado inicial Pendiente) y, en la misma operación, una entrada de auditoría (RF-15) con el target y el timestamp — ambas escrituras dentro de la misma transacción de base de datos: si la auditoría falla, el histórico tampoco se confirma",
+        "PATCH /scans/{scan_id} actualiza el estado de una entrada existente (llamado por el Gateway al recibir un desenlace); un scan_id inexistente responde 404",
+        "GET /users/me/scans devuelve el histórico del llamante (RF-13), nunca el de otro usuario",
+        "GET /users/me/audit devuelve las entradas de auditoría del llamante (RF-15)",
+        "Las mismas reglas de autorización por header de identidad + credencial de servicio de la feature user_profile_api aplican a todas las rutas de esta feature",
+        "Tests de integración (#[ignore = \"requiere Docker\"]): registrar escaneo crea histórico + auditoría atómicamente; actualizar estado se refleja en GET /users/me/scans; scan_id inexistente en PATCH -> 404; un usuario no puede leer el histórico/auditoría de otro (probado con dos identidades distintas)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 7,
+      "name": "service_wiring",
+      "title": "Orquestación del servicio: composition root y health check",
+      "description": "Conecta config -> repository -> api en src/lib.rs (función run()), invocada desde src/main.rs, y expone un endpoint de salud para observabilidad (RNF-09).",
+      "acceptance": [
+        "src/wiring.rs (composition root) construye el pool de conexión sqlx desde Config y ejecuta las migraciones pendientes al arrancar",
+        "lib::run() arma el router axum completo (perfil + histórico + auditoría + health) y lo pone a escuchar en el host/puerto de Config",
+        "GET /health responde 200 sin exigir la credencial de servicio, y refleja un fallo de conectividad a Postgres con un status no-200 (no solo 'proceso vivo')",
+        "Un test de integración end-to-end (#[ignore = \"requiere Docker\"]) levanta el servicio real sobre un Postgres de test y ejerce el flujo completo: crear perfil -> registrar escaneo -> consultar histórico -> consultar auditoría, todo vía HTTP real (no llamando a los handlers como funciones sueltas)",
+        "Un fallo de Postgres al arrancar (migraciones o conexión) se reporta con un error explícito y el proceso no arranca a medias"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 8,
+      "name": "containerization",
+      "title": "Imagen Docker de producción de ms-usuarios",
+      "description": "Dockerfile multi-stage que compila el binario ms-usuarios y produce una imagen final mínima para desplegar el servicio, mismo patrón que nmap-service.",
+      "acceptance": [
+        "Existe Dockerfile multi-stage en la raíz: stage builder con la toolchain Rust que hace cargo build --release, stage final mínimo (distroless/cc o debian-slim) con solo el binario ms-usuarios, las migraciones necesarias para aplicarlas al arrancar (si el diseño elegido en service_wiring las embebe en el binario vía sqlx::migrate!, no hace falta copiarlas aparte) y certificados CA",
+        "La imagen final no contiene toolchain de compilación ni código fuente",
+        "El contenedor corre como usuario no-root",
+        "El binario lee toda su configuración de variables de entorno (ya cubierto por config, feature 2); se documentan en README las env vars requeridas para docker run",
+        "Existe .dockerignore que excluye al menos target/, .git/, .claude/, progress/, docs/",
+        "Las imágenes base están fijadas por tag concreto (no latest), idealmente por digest",
+        "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
+        "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no)"
+      ],
+      "status": "pending"
+    }
+  ]
+}
