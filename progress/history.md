@@ -67,3 +67,27 @@ la sesión que implemente la feature 1 (`scaffolding`)._
   `APPROVED` en `progress/review_2.md` (sin cambios requeridos; se anotó
   como pendiente no bloqueante que el líder añadiera esta entrada de
   historial al cerrar la sesión, lo cual se hace aquí).
+
+## Sesión — feature 3 (domain_model) — 2026-09-18
+
+**Estado final:** `done` (aprobada, ver `progress/review_3.md`).
+
+- `src/domain.rs`: `UserProfile { user_id, email, display_name, created_at }`,
+  `ScanHistoryEntry { scan_id, user_id, target, status: ScanStatus,
+  requested_at, updated_at }` con `ScanStatus` como enum cerrado (`Pendiente`,
+  `EnProgreso`, `Completado`, `Fallido`, los 4 estados de RF-07; un string
+  desconocido falla la deserialización en vez de caer en un default), y
+  `AuditEntry { id, user_id, target, action, recorded_at }` con campos
+  privados y solo getters de lectura — sin `&mut self` ni setters, append-only
+  por diseño del propio tipo.
+- Todos los tipos derivan `Serialize`/`Deserialize`.
+- `Cargo.toml`: añadida dependencia `chrono` (feature `serde`) para los
+  timestamps.
+- 10 tests unitarios: round-trip de serialización de los tres tipos,
+  encoding estable de `ScanStatus`, y rechazo de una variante desconocida al
+  deserializar.
+- No se tocó lógica de otras features (`config` intacto desde la feature 2;
+  `repository`, `audit`, `api` siguen como stubs).
+- `./init.sh` en verde (fmt, clippy, tests, doc).
+- Revisión: `reviewer` independiente lanzado por el líder, veredicto
+  `APPROVED` en `progress/review_3.md`.

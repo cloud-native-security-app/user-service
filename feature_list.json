@@ -49,7 +49,7 @@
         "Ningún tipo de este módulo permite construir una instancia con datos parcialmente inválidos silenciosamente (p. ej. un ScanStatus fuera de las 4 variantes no compila)",
         "Test unitario cubre (de)serialización round-trip de cada tipo y el encoding estable de ScanStatus"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 4,
