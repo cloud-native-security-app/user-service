@@ -102,12 +102,19 @@ documentada en `feature_list.json`.
 ## Despliegue
 
 > Detalle práctico (variables de entorno exactas, ejemplo de `docker run`)
-> vive en `README.md` §"Despliegue" una vez exista el `Dockerfile` (feature
-> `containerization`) — esta sección explica el *por qué*, no lo duplica.
+> vive en `README.md` §"Despliegue (Docker)" — esta sección explica el *por
+> qué*, no lo duplica.
 
-El servicio se empaquetará con un `Dockerfile` multi-stage (stage builder con
-la toolchain Rust, stage runtime mínimo tipo distroless, usuario no-root),
-mismo patrón que `nmap-service`. No se asume todavía un proveedor cloud
+El servicio se empaqueta con un `Dockerfile` multi-stage (stage builder con
+la toolchain Rust, stage runtime mínimo distroless, usuario no-root), mismo
+patrón que `nmap-service`. La imagen final incluye únicamente el binario
+`user_service` y los certificados CA del sistema (ya provistos por la base
+`gcr.io/distroless/cc-debian12:nonroot`); las migraciones de `migrations/`
+no se copian a la imagen porque `sqlx::migrate!("./migrations")` (ver
+`src/wiring.rs`) las embebe dentro del propio binario en tiempo de
+compilación. La imagen final **no incluye** la toolchain de Rust, el código
+fuente, ni shell/coreutils — es deliberadamente inspeccionable y de
+superficie de ataque mínima. No se asume todavía un proveedor cloud
 concreto para `db-usuarios` ni para el propio servicio — se documenta en
 términos genéricos hasta que el usuario decida una plataforma de despliegue,
 mismo principio que documenta `broker/docs/architecture.md` §"Por qué no se

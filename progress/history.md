@@ -265,3 +265,38 @@ la sesión que implemente la feature 1 (`scaffolding`)._
   separación real de los dos pools, y que el health check hace una
   comprobación real de conectividad. Veredicto `APPROVED` en
   `progress/review_7.md`.
+
+## Sesión — feature 8 (containerization) — 2026-09-18
+
+**Estado final:** `done` (aprobada, ver `progress/review_8.md`). Última
+feature de `feature_list.json` — las 8 quedan `done`.
+
+- `Dockerfile` (nuevo, multi-stage, mismo patrón que
+  `nmap-service/Dockerfile`): stage `builder` (`rust:1.98-bookworm`,
+  fijado por tag y digest, cachea dependencias antes de copiar `src/`),
+  stage final `gcr.io/distroless/cc-debian12:nonroot` (fijado por tag y
+  digest) con solo el binario `user_service` — sin toolchain, sin código
+  fuente, sin shell. No copia `migrations/`: se embeben en el binario vía
+  `sqlx::migrate!("./migrations")` (feature 7), confirmado explícitamente.
+  Corre como `USER nonroot`.
+- `.dockerignore` (nuevo): excluye `target/`, `.git/`, `.claude/`,
+  `progress/`, `docs/`, `tests/`, archivos `*.md`, entre otros.
+- `README.md` §"Despliegue (Docker)": documenta las 5 variables de entorno
+  (`DATABASE_URL`, `HTTP_HOST`, `HTTP_PORT`, `GATEWAY_SHARED_SECRET`
+  requeridas; `MIGRATIONS_DATABASE_URL` opcional, con la razón de ser de la
+  separación de roles migrador/aplicación) y ejemplo de `docker
+  build`/`docker run`.
+- `docs/architecture.md`: nota breve de despliegue (qué incluye/no incluye
+  la imagen).
+- Verificación real con Docker (no solo documentada), repetida de forma
+  independiente por el implementer y luego por el reviewer: `docker build`
+  exitoso (imagen ~11.9MB), confirmación de que no hay shell ni toolchain
+  en la imagen final (`docker history`/intento fallido de exec), y `docker
+  run` real contra un `postgres:16-alpine` de prueba que aplicó las
+  migraciones (tablas + rol `ms_usuarios_app` creados) y respondió `200
+  OK` en `GET /health` — con limpieza de todos los recursos de prueba
+  creados por ambos.
+- Revisión: `reviewer` independiente re-ejecutó él mismo `docker build`, la
+  verificación de ausencia de shell/toolchain, y el arranque contra un
+  Postgres real propio, sin depender únicamente del reporte del
+  implementer. Veredicto `APPROVED` en `progress/review_8.md`.
