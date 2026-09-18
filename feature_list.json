@@ -21,7 +21,7 @@
         "Existe migrations/ (vacío o con un README) preparado para las migraciones de sqlx de la feature postgres_persistence",
         "cargo build compila sin warnings"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 2,
