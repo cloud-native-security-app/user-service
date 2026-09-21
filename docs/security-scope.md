@@ -67,6 +67,39 @@
 - Si en el futuro se necesita "corregir" una entrada errónea, la solución es
   una entrada nueva que referencia a la anterior, nunca editar la existente.
 
+## Credenciales de red (feature `network_credentials_api`)
+
+- `ssh_credentials_ref` (referencia a la credencial SSH real para
+  autenticarse en un objetivo) es **una credencial de infraestructura**, no
+  un dato personal — pero es igual de sensible: si se filtra, un atacante
+  puede usarla para autenticarse en los objetivos de la plataforma.
+- **Cifrado en reposo obligatorio:** `ssh_credentials_ref` **nunca** se
+  persiste en claro. La tabla `network_credentials` guarda
+  `ssh_credentials_ref_ciphertext` (AES-256-GCM) y `ssh_credentials_ref_nonce`
+  (12 bytes aleatorios por fila). La clave (`CREDENTIALS_ENCRYPTION_KEY`,
+  32 bytes, hex de 64 caracteres) es **requerida** en `src/config.rs` y se
+  trata con el mismo cuidado que `GATEWAY_SHARED_SECRET`: nunca se
+  hardcodea, nunca se loggea, nunca se incluye en un mensaje de error. La
+  única operación que la usa es cifrar al upsert y descifrar en
+  `Repository::resolve_scan_target`.
+- **Salida mínima:** el valor en claro solo sale por
+  `GET /users/me/scan-targets` (contrato con
+  `gateway::usuarios_client::ScanTargetCredentials`, shape EXACTO
+  `{network_user, ssh_credentials_ref, has_sudo}`). `POST`/`GET
+  /users/me/network-credentials` **nunca** devuelven `ssh_credentials_ref`;
+  `ResolvedScanTarget` redacta el campo en su `Debug`, igual que el
+  `ScanTargetCredentials` del Gateway.
+- **Autorización a nivel de fila:** un usuario solo configura/lista/borra
+  sus propias credenciales. `DELETE /users/me/network-credentials/{id}` de
+  una entrada ajena responde `404` (nunca `403`), para no revelar a quién
+  pertenece un `id`.
+- **Matching de objetivos deliberado:** `target_pattern` acepta IP exacta o
+  CIDR (v4/v6) validados en el borde (`400` si no); un objetivo se resuelve
+  contra las entradas del llamante y, si varias matchean, gana la del
+  prefijo más largo. Este matching existe para que el Gateway pueda
+  preguntar "¿qué credencial uso para 203.0.113.7?" — no es un permiso de
+  escaneo: quién puede escanear qué sigue siendo decisión del Gateway.
+
 ## Comunicación y transporte
 
 - Toda comunicación hacia este servicio viaja sobre la subred privada

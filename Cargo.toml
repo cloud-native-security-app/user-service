@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -16,6 +16,10 @@ thiserror = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 subtle = "2"
 uuid = { version = "1", features = ["v4"] }
+aes-gcm = "0.10"
+ipnetwork = "0.20"
+hex = "0.4"
+rand = "0.8"
 
 [dev-dependencies]
 testcontainers = "0.27"

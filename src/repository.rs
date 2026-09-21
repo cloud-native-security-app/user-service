@@ -1,5 +1,5 @@
-//! Persistencia en PostgreSQL vía `sqlx`: perfiles, histórico de escaneos y
-//! auditoría.
+//! Persistencia en PostgreSQL vía `sqlx`: perfiles, histórico de escaneos,
+//! auditoría y credenciales de red.
 //!
 //! [`Repository`] envuelve un [`sqlx::PgPool`] ya construido por el
 //! llamante (en producción, la feature `service_wiring`; en los tests de
@@ -11,10 +11,37 @@
 //! y `docs/security-scope.md`): este módulo, a propósito, no expone ningún
 //! método `update`/`delete` para esa tabla, ni siquiera uno que dependiera
 //! de que el rol de base de datos lo permitiera.
+//!
+//! ## Credenciales de red (feature `network_credentials_api`)
+//!
+//! `ssh_credentials_ref` es una credencial SSH **real** hacia
+//! infraestructura de terceros (ver `docs/security-scope.md` §"Credenciales
+//! de red"), así que nunca se persiste en claro: este módulo la cifra con
+//! AES-256-GCM antes de cada `INSERT`/`UPDATE` (nonce aleatorio por fila)
+//! con la clave `Repository::encryption_key`, y la descifra únicamente en
+//! [`Repository::resolve_scan_target`], el único punto donde el servicio la
+//! devuelve. El parseo de IP/CIDR y el matching de objetivos (contención,
+//! patrón más específico gana) son funciones puras — [`parse_target`] (pública
+//! y de borde), más `network_matches`/`best_target_match` (privadas,
+//! cubiertas por tests unitarios) — sin dependencia de IO, para poder
+//! testearlas sin Docker.
 
+use std::net::IpAddr;
+
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use ipnetwork::IpNetwork;
+use rand::RngCore;
+use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::PgPool;
 
-use crate::domain::{AuditEntry, ScanHistoryEntry, ScanStatus, UserProfile};
+use crate::domain::{
+    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus, UserProfile,
+};
+
+/// Longitud del nonce de AES-256-GCM (96 bits, el tamaño que exige la
+/// construcción `Aes256Gcm`).
+const AES_GCM_NONCE_LEN: usize = 12;
 
 /// Acceso a la persistencia de `ms-usuarios` en PostgreSQL.
 ///
@@ -23,12 +50,18 @@ use crate::domain::{AuditEntry, ScanHistoryEntry, ScanStatus, UserProfile};
 /// arnés de test en los tests de integración de este módulo).
 pub struct Repository {
     pool: PgPool,
+    encryption_key: SecretSlice<u8>,
 }
 
 impl Repository {
-    /// Construye un [`Repository`] a partir de un [`PgPool`] ya conectado.
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    /// Construye un [`Repository`] a partir de un [`PgPool`] ya conectado y
+    /// la clave de cifrado en reposo de las credenciales de red (ver
+    /// `docs/security-scope.md` §"Credenciales de red").
+    pub fn new(pool: PgPool, encryption_key: SecretSlice<u8>) -> Self {
+        Self {
+            pool,
+            encryption_key,
+        }
     }
 
     /// Crea el perfil de `profile.user_id` si no existe, o actualiza
@@ -272,6 +305,174 @@ impl Repository {
 
         Ok(rows.into_iter().map(AuditEntry::from).collect())
     }
+
+    /// Crea o actualiza (upsert por `user_id` + `target_pattern`) la entrada
+    /// de credenciales de red del usuario para un objetivo (feature
+    /// `network_credentials_api`). El `id` de la fila lo asigna el llamante
+    /// (generado por `api`, como el `scan_id` del histórico); al actualizar
+    /// una entrada existente ese `id` original se conserva.
+    ///
+    /// `ssh_credentials_ref` se cifra con AES-256-GCM (nonce aleatorio por
+    /// fila) antes del `INSERT`/`UPDATE` — nunca se persiste en claro. La
+    /// entrada devuelta (`[`NetworkCredential`]`) no incluye la credencial.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError`] si la consulta falla (p. ej. `user_id` no
+    /// referencia a un usuario existente, o el cifrado falla — este último
+    /// nunca ocurre con una clave válida). Nunca hace `panic!`.
+    pub async fn upsert_network_credential(
+        &self,
+        id: uuid::Uuid,
+        user_id: &str,
+        target_pattern: &str,
+        network_user: &str,
+        ssh_credentials_ref: &str,
+        has_sudo: bool,
+    ) -> Result<NetworkCredential, RepoError> {
+        let (ciphertext, nonce) =
+            encrypt_secret(ssh_credentials_ref, self.encryption_key.expose_secret())?;
+
+        let row = sqlx::query_as::<_, NetworkCredentialMetaRow>(
+            "INSERT INTO network_credentials \
+             (id, user_id, target_pattern, network_user, ssh_credentials_ref_ciphertext, \
+              ssh_credentials_ref_nonce, has_sudo, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) \
+             ON CONFLICT (user_id, target_pattern) DO UPDATE SET \
+               network_user = EXCLUDED.network_user, \
+               ssh_credentials_ref_ciphertext = EXCLUDED.ssh_credentials_ref_ciphertext, \
+               ssh_credentials_ref_nonce = EXCLUDED.ssh_credentials_ref_nonce, \
+               has_sudo = EXCLUDED.has_sudo, \
+               updated_at = now() \
+             RETURNING id, user_id, target_pattern, network_user, has_sudo, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(target_pattern)
+        .bind(network_user)
+        .bind(ciphertext)
+        .bind(nonce)
+        .bind(has_sudo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(NetworkCredential::from(row))
+    }
+
+    /// Devuelve las entradas de credenciales de red de `user_id`
+    /// (feature `network_credentials_api`), sin la credencial SSH — la
+    /// única salida posible de ese valor en claro es
+    /// [`Repository::resolve_scan_target`].
+    ///
+    /// Un `user_id` sin entradas (o inexistente) devuelve un `Vec` vacío,
+    /// nunca un error.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
+    pub async fn list_network_credentials(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<NetworkCredential>, RepoError> {
+        let rows = sqlx::query_as::<_, NetworkCredentialMetaRow>(
+            "SELECT id, user_id, target_pattern, network_user, has_sudo, created_at, updated_at \
+             FROM network_credentials WHERE user_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(NetworkCredential::from).collect())
+    }
+
+    /// Borra la entrada de credenciales de red con `id`, **solo si
+    /// pertenece a `user_id`** (autorización a nivel de fila, ver
+    /// `docs/security-scope.md`).
+    ///
+    /// Un `id` inexistente, o un `id` existente pero de otro usuario,
+    /// devuelve [`RepoError::NotFound`] — el endpoint responde `404` en
+    /// ambos casos sin revelar a quién pertenece la entrada (decisión
+    /// explícita de la feature `network_credentials_api`).
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError::NotFound`] si el `DELETE` no afectó ninguna
+    /// fila, o [`RepoError`] si la consulta falla por otro motivo. Nunca
+    /// hace `panic!`.
+    pub async fn delete_network_credential(
+        &self,
+        id: uuid::Uuid,
+        user_id: &str,
+    ) -> Result<(), RepoError> {
+        let result = sqlx::query("DELETE FROM network_credentials WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepoError::NotFound);
+        }
+
+        Ok(())
+    }
+
+    /// Resuelve las credenciales de red de `user_id` que mejor matchean el
+    /// objetivo `target` (IP exacta o CIDR, ya validado por el llamante) —
+    /// feature `network_credentials_api`.
+    ///
+    /// Reglas de matching (ver la feature en `feature_list.json`): un
+    /// `target_pattern` matchea si `target` es una IP contenida en él, o si
+    /// son el mismo CIDR. Si varias entradas matchean, gana la de
+    /// `target_pattern` más específico (prefijo más largo). El valor en
+    /// claro de `ssh_credentials_ref` se descifra **solo** aquí — es el
+    /// único punto del repositorio donde la credencial sale de su cifrado.
+    ///
+    /// Un usuario sin ninguna entrada que matchee devuelve `Ok(None)`,
+    /// nunca un error (la API lo traduce a `422`).
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError::Backend`] si una `target_pattern` almacenada no
+    /// se puede parsear (no debería ocurrir porque se valida al escribirse),
+    /// si el descifrado falla (cifrado manipulado), o por cualquier otro
+    /// fallo de consulta. Nunca hace `panic!`.
+    pub async fn resolve_scan_target(
+        &self,
+        user_id: &str,
+        target: IpNetwork,
+    ) -> Result<Option<ResolvedScanTarget>, RepoError> {
+        let rows = sqlx::query_as::<_, NetworkCredentialRow>(
+            "SELECT target_pattern, network_user, ssh_credentials_ref_ciphertext, \
+             ssh_credentials_ref_nonce, has_sudo \
+             FROM network_credentials WHERE user_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let patterns = rows
+            .iter()
+            .map(|row| parse_target(&row.target_pattern).ok_or(RepoError::Backend))
+            .collect::<Result<Vec<IpNetwork>, RepoError>>()?;
+
+        let Some(index) = best_target_match(&patterns, target) else {
+            return Ok(None);
+        };
+
+        let row = &rows[index];
+        let ssh_credentials_ref = decrypt_secret(
+            &row.ssh_credentials_ref_ciphertext,
+            &row.ssh_credentials_ref_nonce,
+            self.encryption_key.expose_secret(),
+        )?;
+
+        Ok(Some(ResolvedScanTarget {
+            network_user: row.network_user.clone(),
+            ssh_credentials_ref,
+            has_sudo: row.has_sudo,
+        }))
+    }
 }
 
 /// Fila cruda de la tabla `users`, mapeada a [`UserProfile`] vía `From`.
@@ -372,6 +573,138 @@ fn status_from_db_str(value: &str) -> Result<ScanStatus, RepoError> {
     }
 }
 
+/// Fila de `network_credentials` con los metadatos de la entrada (sin el
+/// cifrado de la credencial), mapeada a [`NetworkCredential`] vía `From`.
+#[derive(sqlx::FromRow)]
+struct NetworkCredentialMetaRow {
+    id: uuid::Uuid,
+    user_id: String,
+    target_pattern: String,
+    network_user: String,
+    has_sudo: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fila de `network_credentials` con lo que necesita
+/// [`Repository::resolve_scan_target`]: el patrón a cotejar, el usuario de
+/// red y el cifrado en reposo de `ssh_credentials_ref` (ciphertext + nonce)
+/// para poder descifrarla solo aquí.
+#[derive(sqlx::FromRow)]
+struct NetworkCredentialRow {
+    target_pattern: String,
+    network_user: String,
+    ssh_credentials_ref_ciphertext: Vec<u8>,
+    ssh_credentials_ref_nonce: Vec<u8>,
+    has_sudo: bool,
+}
+
+impl From<NetworkCredentialMetaRow> for NetworkCredential {
+    fn from(row: NetworkCredentialMetaRow) -> Self {
+        NetworkCredential {
+            id: row.id.to_string(),
+            user_id: row.user_id,
+            target_pattern: row.target_pattern,
+            network_user: row.network_user,
+            has_sudo: row.has_sudo,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// Parsea un objetivo válido de la API: una IP exacta (v4 o v6) o un CIDR
+/// (v4 o v6), vía el crate `ipnetwork`. Devuelve `None` si el valor no es
+/// ninguna de las dos cosas — nunca hace `panic!`, y nunca acepta un
+/// string inválido como si fuera un objetivo.
+///
+/// Es una función pura sin dependencia de IO: la usan tanto `api` para
+/// validar en el borde (400 si devuelve `None`) como `repository` para
+/// re-parsear las `target_pattern` almacenadas al resolver.
+pub fn parse_target(value: &str) -> Option<IpNetwork> {
+    if let Ok(network) = value.parse::<IpNetwork>() {
+        return Some(network);
+    }
+    value.parse::<IpAddr>().ok().map(IpNetwork::from)
+}
+
+/// Devuelve `true` si `pattern` matchea `target` según la semántica de la
+/// feature `network_credentials_api`: igualdad exacta (misma IP, o el mismo
+/// CIDR), o `target` es una IP exacta contenida dentro del CIDR `pattern`.
+///
+/// Un objetivo que es en sí un CIDR solo matchea si es exactamente el mismo
+/// CIDR — no si es una subred de otro (el contrato de la feature dice "si son
+/// el mismo CIDR", no "si está contenido en otro CIDR").
+fn network_matches(pattern: IpNetwork, target: IpNetwork) -> bool {
+    if pattern == target {
+        return true;
+    }
+    let target_is_exact_ip = match target.ip() {
+        IpAddr::V4(_) => target.prefix() == 32,
+        IpAddr::V6(_) => target.prefix() == 128,
+    };
+    target_is_exact_ip && pattern.contains(target.ip())
+}
+
+/// Índice del `target_pattern` entre `patterns` que mejor matchea `target`,
+/// o `None` si ninguno matchea.
+///
+/// Si varias entradas matchean, gana la de prefijo más largo (más
+/// específica). No puede haber empate a prefijo para un mismo usuario
+/// porque la tabla impone unicidad en `(user_id, target_pattern)` — pero si
+/// lo hubiera, `max_by_key` devolvería cualquiera de los empatados.
+fn best_target_match(patterns: &[IpNetwork], target: IpNetwork) -> Option<usize> {
+    patterns
+        .iter()
+        .enumerate()
+        .filter(|(_, pattern)| network_matches(**pattern, target))
+        .max_by_key(|(_, pattern)| pattern.prefix())
+        .map(|(index, _)| index)
+}
+
+/// Cifra `value` con AES-256-GCM usando `key`, con un nonce aleatorio
+/// (96 bits) distinto en cada llamada. Devuelve `(ciphertext, nonce)`; el
+/// nonce se persiste junto al ciphertext para poder descifrar después.
+///
+/// # Errores
+///
+/// Devuelve [`RepoError::Backend`] si la operación de cifrado falla (no
+/// debería ocurrir con una clave válida). Nunca hace `panic!`.
+fn encrypt_secret(value: &str, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RepoError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+
+    let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes())
+        .map_err(|_| RepoError::Backend)?;
+
+    Ok((ciphertext, nonce_bytes.to_vec()))
+}
+
+/// Descifra el `ciphertext` cifrado con [`encrypt_secret`] usando `key` y el
+/// `nonce` que se guardó junto a él.
+///
+/// # Errores
+///
+/// Devuelve [`RepoError::Backend`] si el nonce no tiene la longitud
+/// esperada (96 bits), si el ciphertext fue manipulado (falla la
+/// autenticación de AES-GCM), o si el resultado no es UTF-8 válido. Nunca
+/// hace `panic!`.
+fn decrypt_secret(ciphertext: &[u8], nonce: &[u8], key: &[u8]) -> Result<String, RepoError> {
+    if nonce.len() != AES_GCM_NONCE_LEN {
+        return Err(RepoError::Backend);
+    }
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| RepoError::Backend)?;
+
+    String::from_utf8(plaintext).map_err(|_| RepoError::Backend)
+}
+
 /// Error devuelto por las operaciones de [`Repository`].
 ///
 /// Ninguna variante contiene datos personales (email, nombre) ni el texto
@@ -424,9 +757,16 @@ impl From<sqlx::Error> for RepoError {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
     use sqlx::postgres::PgPoolOptions;
 
     use super::*;
+
+    /// Clave de cifrado de laboratorio (32 bytes) para los tests que no
+    /// requieren Docker.
+    fn test_encryption_key() -> SecretSlice<u8> {
+        SecretSlice::from(vec![0x07u8; 32])
+    }
 
     #[test]
     fn status_round_trips_through_its_db_encoding() {
@@ -463,7 +803,7 @@ mod tests {
             .acquire_timeout(std::time::Duration::from_secs(2))
             .connect_lazy("postgres://user:pass@127.0.0.1:1/db")
             .expect("connect_lazy no debe fallar de forma síncrona");
-        let repo = Repository::new(pool);
+        let repo = Repository::new(pool, test_encryption_key());
 
         let result = repo.find_user("someone").await;
 
@@ -471,5 +811,155 @@ mod tests {
             matches!(result, Err(RepoError::ConnectionFailed)),
             "se esperaba RepoError::ConnectionFailed, se obtuvo: {result:?}"
         );
+    }
+
+    #[test]
+    fn parse_target_accepts_exact_ipv4_and_ipv6_and_cidrs() {
+        assert_eq!(
+            parse_target("203.0.113.7"),
+            Some("203.0.113.7/32".parse::<IpNetwork>().expect("ip v4"))
+        );
+        assert_eq!(
+            parse_target("2001:db8::1"),
+            Some("2001:db8::1/128".parse::<IpNetwork>().expect("ip v6"))
+        );
+        assert_eq!(
+            parse_target("203.0.113.0/24"),
+            Some("203.0.113.0/24".parse().expect("cidr v4"))
+        );
+        assert_eq!(
+            parse_target("2001:db8::/32"),
+            Some("2001:db8::/32".parse().expect("cidr v6"))
+        );
+        assert_eq!(parse_target("203.0.113.7/33"), None);
+        assert_eq!(parse_target("2001:db8::/129"), None);
+    }
+
+    #[test]
+    fn parse_target_rejects_invalid_values_instead_of_panicking() {
+        for value in [
+            "no-es-una-ip",
+            "203.0.113.7/24-junk",
+            "999.999.999.999",
+            "",
+            "203.0.113.",
+        ] {
+            assert_eq!(parse_target(value), None, "se esperaba None para {value:?}");
+        }
+    }
+
+    #[test]
+    fn network_matches_exact_same_cidr_but_not_overlapping_cidrs() {
+        let pattern: IpNetwork = "203.0.113.0/24".parse().expect("cidr");
+        let same_cidr: IpNetwork = "203.0.113.0/24".parse().expect("cidr");
+        // Un objetivo que es en sí un CIDR solo matchea si es el mismo CIDR.
+        let more_specific_cidr: IpNetwork = "203.0.113.0/28".parse().expect("cidr");
+        assert!(network_matches(pattern, same_cidr));
+        assert!(!network_matches(pattern, more_specific_cidr));
+
+        let exact_ip: IpNetwork = "203.0.113.7/32".parse().expect("ip");
+        assert!(network_matches(pattern, exact_ip));
+        let exact_ip_v6: IpNetwork = "2001:db8::5/128".parse().expect("ip");
+        assert!(network_matches(
+            "2001:db8::/32".parse().expect("cidr"),
+            exact_ip_v6
+        ));
+    }
+
+    #[test]
+    fn network_matches_exact_ip_does_not_match_a_larger_or_different_cidr() {
+        let pattern: IpNetwork = "203.0.113.7/32".parse().expect("ip");
+        let other_ip: IpNetwork = "203.0.113.8/32".parse().expect("ip");
+        let contained_cidr: IpNetwork = "203.0.113.0/24".parse().expect("cidr");
+        assert!(!network_matches(pattern, other_ip));
+        assert!(!network_matches(pattern, contained_cidr));
+    }
+
+    #[test]
+    fn best_target_match_prefers_the_most_specific_pattern() {
+        let patterns = [
+            "0.0.0.0/0".parse::<IpNetwork>().expect("any"),
+            "203.0.113.0/24".parse::<IpNetwork>().expect("med"),
+            "203.0.113.0/28".parse::<IpNetwork>().expect("spec"),
+        ];
+        let target: IpNetwork = "203.0.113.7/32".parse().expect("ip");
+
+        assert_eq!(best_target_match(&patterns, target), Some(2));
+    }
+
+    #[test]
+    fn best_target_match_returns_none_when_nothing_matches() {
+        let patterns = ["10.20.0.0/16".parse::<IpNetwork>().expect("cidr")];
+        let target: IpNetwork = "203.0.113.7/32".parse().expect("ip");
+
+        assert_eq!(best_target_match(&patterns, target), None);
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips_the_secret() {
+        let key = test_encryption_key();
+        let ciphertext = "lab-only-credential-ref".to_string();
+
+        let (sealed, nonce) = encrypt_secret(&ciphertext, key.expose_secret()).expect("cifra");
+
+        assert_ne!(sealed.as_slice(), ciphertext.as_bytes());
+        assert_eq!(nonce.len(), AES_GCM_NONCE_LEN);
+
+        let opened = decrypt_secret(&sealed, &nonce, key.expose_secret()).expect("descifra");
+        assert_eq!(opened, ciphertext);
+    }
+
+    #[test]
+    fn encrypt_uses_a_distinct_nonce_per_call() {
+        let key = test_encryption_key();
+        let secret = "mismo-secreto-distinto-nonce".to_string();
+
+        let (first, first_nonce) = encrypt_secret(&secret, key.expose_secret()).expect("cifra");
+        let (second, second_nonce) = encrypt_secret(&secret, key.expose_secret()).expect("cifra");
+
+        assert_ne!(first_nonce, second_nonce);
+        assert_ne!(
+            first, second,
+            "nonces distintos deben dar ciphertexts distintos"
+        );
+    }
+
+    #[test]
+    fn decrypt_rejects_tampered_ciphertext_instead_of_panicking() {
+        let key = test_encryption_key();
+        let (mut sealed, nonce) =
+            encrypt_secret("credencial-de-lab", key.expose_secret()).expect("cifra");
+
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xFF;
+
+        assert!(matches!(
+            decrypt_secret(&sealed, &nonce, key.expose_secret()),
+            Err(RepoError::Backend)
+        ));
+    }
+
+    #[test]
+    fn decrypt_rejects_an_invalid_nonce_length_instead_of_panicking() {
+        let key = test_encryption_key();
+        let (sealed, _nonce) =
+            encrypt_secret("credencial-de-lab", key.expose_secret()).expect("cifra");
+
+        assert!(matches!(
+            decrypt_secret(&sealed, &[0u8; 7], key.expose_secret()),
+            Err(RepoError::Backend)
+        ));
+    }
+
+    #[test]
+    fn decrypt_with_the_wrong_key_fails_instead_of_panicking() {
+        let key: [u8; 32] = [0x07u8; 32];
+        let wrong_key: [u8; 32] = [0x08u8; 32];
+        let (sealed, nonce) = encrypt_secret("credencial-de-lab", &key).expect("cifra");
+
+        assert!(matches!(
+            decrypt_secret(&sealed, &nonce, &wrong_key),
+            Err(RepoError::Backend)
+        ));
     }
 }

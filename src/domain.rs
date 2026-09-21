@@ -8,6 +8,8 @@
 //! `Display` ni participa en un mensaje de log o de error; su único uso es
 //! como estructura de datos serializable para la API HTTP.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +139,71 @@ impl AuditEntry {
     }
 }
 
+/// Credenciales de red configuradas por un usuario para un objetivo (IP
+/// exacta o CIDR): qué `network_user` usar al conectarse, si tiene `sudo`, y
+/// — guardada cifrada en reposo, ver `docs/security-scope.md` §"Credenciales
+/// de red" — la referencia a la credencial SSH real.
+///
+/// Deliberadamente **no** incluye la credencial SSH (`ssh_credentials_ref`):
+/// ese valor nunca sale del repositorio — ni en claro ni cifrado — salvo en
+/// la respuesta puntual de `GET /users/me/scan-targets` (feature
+/// `network_credentials_api`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NetworkCredential {
+    /// Identificador único de la entrada, asignado por este servicio.
+    pub id: String,
+    /// Identidad del usuario que configuró la entrada (el `sub` reenviado
+    /// por el Gateway; ver [`UserProfile`]).
+    pub user_id: String,
+    /// IP exacta o CIDR (v4 o v6) al que aplica esta entrada, tal como el
+    /// usuario lo configuró. Validado en el borde (ver
+    /// `repository::parse_target`).
+    pub target_pattern: String,
+    /// Usuario de red a usar para autenticarse en el objetivo.
+    pub network_user: String,
+    /// Si `network_user` tiene privilegios `sudo` en el objetivo.
+    pub has_sudo: bool,
+    /// Marca de tiempo en la que se creó la entrada.
+    pub created_at: DateTime<Utc>,
+    /// Marca de tiempo de la última actualización de la entrada.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Credenciales de red resueltas para un objetivo concreto, devueltas por
+/// `GET /users/me/scan-targets` en el shape EXACTO que espera
+/// `gateway::usuarios_client::ScanTargetCredentials` (confirmado por lectura
+/// directa de ese repo hermano): `network_user`, `ssh_credentials_ref` y
+/// `has_sudo`, y solo esos 3 campos.
+///
+/// `ssh_credentials_ref` es una credencial SSH **real**: este tipo
+/// implementa `Debug` a mano para redactarla, igual que
+/// `gateway::usuarios_client::ScanTargetCredentials`, de modo que nunca
+/// pueda colarse en un log vía `tracing::*!` ni en un `panic` message (ver
+/// `docs/security-scope.md` §"Credenciales de red").
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedScanTarget {
+    /// Usuario de red a usar para autenticarse en el objetivo.
+    pub network_user: String,
+    /// Credencial SSH real para autenticarse en el objetivo. Nunca se
+    /// loggea (redactada en `Debug`, ver [`ResolvedScanTarget`]).
+    pub ssh_credentials_ref: String,
+    /// Si `network_user` tiene privilegios `sudo` en el objetivo.
+    pub has_sudo: bool,
+}
+
+impl fmt::Debug for ResolvedScanTarget {
+    /// Implementación manual para que el credencial SSH real
+    /// (`ssh_credentials_ref`) nunca se imprima en texto plano al
+    /// formatear con `{:?}` — requisito de `docs/security-scope.md`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedScanTarget")
+            .field("network_user", &self.network_user)
+            .field("ssh_credentials_ref", &"[REDACTED]")
+            .field("has_sudo", &self.has_sudo)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -248,5 +315,70 @@ mod tests {
             result.is_err(),
             "un string desconocido debe fallar la deserialización, no caer en un default"
         );
+    }
+
+    #[test]
+    fn network_credential_serializes_without_any_credential_material() {
+        let credential = NetworkCredential {
+            id: "cred-1".to_string(),
+            user_id: "google-oauth2|123456".to_string(),
+            target_pattern: "203.0.113.0/24".to_string(),
+            network_user: "netadmin".to_string(),
+            has_sudo: true,
+            created_at: sample_timestamp(),
+            updated_at: sample_timestamp(),
+        };
+
+        let json = serde_json::to_value(&credential).expect("serializa");
+
+        assert_eq!(json["id"], "cred-1");
+        assert_eq!(json["user_id"], "google-oauth2|123456");
+        assert_eq!(json["target_pattern"], "203.0.113.0/24");
+        assert_eq!(json["network_user"], "netadmin");
+        assert_eq!(json["has_sudo"], true);
+        assert_eq!(
+            json["created_at"],
+            serde_json::to_value(sample_timestamp()).expect("ts")
+        );
+        assert!(
+            json.get("ssh_credentials_ref").is_none(),
+            "NetworkCredential nunca debe serializar la credencial SSH"
+        );
+    }
+
+    #[test]
+    fn resolved_scan_target_serializes_exactly_the_three_contract_fields() {
+        let resolved = ResolvedScanTarget {
+            network_user: "netadmin".to_string(),
+            ssh_credentials_ref: "lab-only-not-a-real-secret".to_string(),
+            has_sudo: true,
+        };
+
+        let json = serde_json::to_value(&resolved).expect("serializa");
+
+        let object = json.as_object().expect("debe ser un objeto");
+        assert_eq!(
+            object.len(),
+            3,
+            "el shape de scan-targets debe ser EXACTO: \
+             {{network_user, ssh_credentials_ref, has_sudo}}"
+        );
+        assert_eq!(json["network_user"], "netadmin");
+        assert_eq!(json["ssh_credentials_ref"], "lab-only-not-a-real-secret");
+        assert_eq!(json["has_sudo"], true);
+    }
+
+    #[test]
+    fn resolved_scan_target_debug_redacts_the_ssh_credential() {
+        let resolved = ResolvedScanTarget {
+            network_user: "netadmin".to_string(),
+            ssh_credentials_ref: "lab-only-not-a-real-secret".to_string(),
+            has_sudo: true,
+        };
+
+        let debug_output = format!("{resolved:?}");
+
+        assert!(!debug_output.contains("lab-only-not-a-real-secret"));
+        assert!(debug_output.contains("REDACTED"));
     }
 }

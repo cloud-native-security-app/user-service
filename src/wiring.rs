@@ -57,7 +57,7 @@ pub async fn build_router(config: &Config) -> Result<Router, WiringError> {
         .map_err(|_| WiringError::DatabaseConnectionFailed)?;
 
     let health_pool = database_pool.clone();
-    let repository = Repository::new(database_pool);
+    let repository = Repository::new(database_pool, config.credentials_encryption_key.clone());
 
     let api_router = api::router(repository, config.gateway_shared_secret.clone());
     let health_router = Router::new()
@@ -117,7 +117,7 @@ pub enum WiringError {
 mod tests {
     use std::time::Duration;
 
-    use secrecy::SecretString;
+    use secrecy::{SecretBox, SecretString};
     use sqlx::postgres::PgPoolOptions;
 
     use super::*;
@@ -147,6 +147,7 @@ mod tests {
             http_host: "127.0.0.1".to_string(),
             http_port: 0,
             gateway_shared_secret: SecretString::from("test-secret".to_string()),
+            credentials_encryption_key: SecretBox::from(vec![0x07u8; 32].into_boxed_slice()),
             migrations_database_url: UNREACHABLE_URL.to_string(),
         };
 

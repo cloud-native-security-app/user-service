@@ -19,6 +19,7 @@
 //!   tests reflejen exactamente los permisos con los que corre el
 //!   repositorio en producción.
 
+use secrecy::SecretSlice;
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::{Error as SqlxError, PgPool, Row};
 use testcontainers::runners::AsyncRunner;
@@ -26,7 +27,16 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 use user_service::domain::{AuditEntry, ScanHistoryEntry, ScanStatus, UserProfile};
-use user_service::repository::{RepoError, Repository};
+use user_service::repository::{parse_target, RepoError, Repository};
+use uuid::Uuid;
+
+/// Clave de cifrado de laboratorio (32 bytes, `0x07`) para los tests — el
+/// valor no importa, solo el invariante de que el Repository recibe una
+/// `SecretSlice` de 32 bytes (ver `docs/security-scope.md` §"Credenciales
+/// de red").
+fn test_encryption_key() -> SecretSlice<u8> {
+    SecretSlice::from(vec![0x07u8; 32])
+}
 
 /// Mantiene vivo el contenedor y ambos pools durante todo el test — si se
 /// descarta `_container`, `testcontainers` lo detiene de inmediato.
@@ -131,7 +141,7 @@ fn sample_scan(scan_id: &str, user_id: &str, status: ScanStatus) -> ScanHistoryE
 #[ignore = "requiere Docker"]
 async fn upsert_user_then_find_returns_the_stored_profile() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-1");
 
     repo.upsert_user(&profile)
@@ -150,7 +160,7 @@ async fn upsert_user_then_find_returns_the_stored_profile() {
 #[ignore = "requiere Docker"]
 async fn find_user_returns_none_when_user_does_not_exist() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
 
     let found = repo
         .find_user("no-existe")
@@ -164,7 +174,7 @@ async fn find_user_returns_none_when_user_does_not_exist() {
 #[ignore = "requiere Docker"]
 async fn upsert_user_updates_email_and_display_name_on_conflict() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let original = sample_profile("test-user-2");
     repo.upsert_user(&original)
         .await
@@ -192,7 +202,7 @@ async fn upsert_user_updates_email_and_display_name_on_conflict() {
 #[ignore = "requiere Docker"]
 async fn insert_scan_history_then_list_returns_the_entry() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-3");
     repo.upsert_user(&profile)
         .await
@@ -218,7 +228,7 @@ async fn insert_scan_history_then_list_returns_the_entry() {
 #[ignore = "requiere Docker"]
 async fn list_scan_history_returns_empty_vec_for_user_without_scans() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-4");
     repo.upsert_user(&profile)
         .await
@@ -236,7 +246,7 @@ async fn list_scan_history_returns_empty_vec_for_user_without_scans() {
 #[ignore = "requiere Docker"]
 async fn update_scan_status_transitions_to_the_new_status() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-5");
     repo.upsert_user(&profile)
         .await
@@ -264,7 +274,7 @@ async fn update_scan_status_transitions_to_the_new_status() {
 #[ignore = "requiere Docker"]
 async fn update_scan_status_returns_not_found_for_unknown_scan_id() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
 
     let result = repo
         .update_scan_status("no-existe", ScanStatus::Completado)
@@ -277,7 +287,7 @@ async fn update_scan_status_returns_not_found_for_unknown_scan_id() {
 #[ignore = "requiere Docker"]
 async fn append_audit_entry_persists_it_and_it_is_readable() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-6");
     repo.upsert_user(&profile)
         .await
@@ -313,7 +323,7 @@ async fn append_audit_entry_persists_it_and_it_is_readable() {
 #[ignore = "requiere Docker"]
 async fn update_and_delete_against_audit_log_fail_by_permissions_for_the_app_role() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-7");
     repo.upsert_user(&profile)
         .await
@@ -362,7 +372,7 @@ async fn update_and_delete_against_audit_log_fail_by_permissions_for_the_app_rol
 #[ignore = "requiere Docker"]
 async fn record_scan_request_persists_history_and_audit_atomically() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-8");
     repo.upsert_user(&profile)
         .await
@@ -401,7 +411,7 @@ async fn record_scan_request_persists_history_and_audit_atomically() {
 #[ignore = "requiere Docker"]
 async fn record_scan_request_rolls_back_history_when_audit_insert_fails() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-9");
     repo.upsert_user(&profile)
         .await
@@ -445,7 +455,7 @@ async fn record_scan_request_rolls_back_history_when_audit_insert_fails() {
 #[ignore = "requiere Docker"]
 async fn list_audit_entries_returns_empty_vec_for_user_without_entries() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let profile = sample_profile("test-user-10");
     repo.upsert_user(&profile)
         .await
@@ -463,7 +473,7 @@ async fn list_audit_entries_returns_empty_vec_for_user_without_entries() {
 #[ignore = "requiere Docker"]
 async fn list_audit_entries_does_not_return_another_users_entries() {
     let db = start_test_db().await;
-    let repo = Repository::new(db.app_pool.clone());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
     let owner = sample_profile("test-user-11-owner");
     let other = sample_profile("test-user-11-other");
     repo.upsert_user(&owner).await.expect("owner debe crearse");
@@ -512,4 +522,389 @@ fn assert_fails_with_permission_denied(result: Result<PgQueryResult, SqlxError>,
              no con {other:?}"
         ),
     }
+}
+
+// --- Tests de credenciales de red (feature `network_credentials_api`, id 10)
+
+const TEST_SSH_REF: &str = "lab-only-ssh-ref-no-es-una-credencial-real";
+
+struct NetworkCredentialTest {
+    db: TestDb,
+    repo: Repository,
+    owner: UserProfile,
+}
+
+async fn start_network_credential_test(user_id: &str) -> NetworkCredentialTest {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let owner = sample_profile(user_id);
+    repo.upsert_user(&owner)
+        .await
+        .expect("el usuario owner debe crearse");
+    NetworkCredentialTest { db, repo, owner }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn upsert_network_credential_then_resolve_exact_ip_returns_the_three_contract_fields() {
+    let harness = start_network_credential_test("test-user-cred-1").await;
+
+    let saved = harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.7",
+            "netadmin",
+            TEST_SSH_REF,
+            true,
+        )
+        .await
+        .expect("el upsert de credenciales debe funcionar");
+    assert_eq!(saved.target_pattern, "203.0.113.7");
+    assert_eq!(saved.network_user, "netadmin");
+    assert!(saved.has_sudo);
+
+    let target = parse_target("203.0.113.7").expect("target válido");
+    let resolved = harness
+        .repo
+        .resolve_scan_target(&harness.owner.user_id, target)
+        .await
+        .expect("resolve no debe fallar");
+
+    let resolved = resolved.expect("debe haber una credencial que matchee la IP exacta");
+    assert_eq!(resolved.network_user, "netadmin");
+    assert_eq!(resolved.ssh_credentials_ref, TEST_SSH_REF);
+    assert!(resolved.has_sudo);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn resolve_scan_target_resolves_an_ip_inside_a_cidr_pattern() {
+    let harness = start_network_credential_test("test-user-cred-2").await;
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "cidr-user",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("el upsert de credenciales debe funcionar");
+
+    let target = parse_target("203.0.113.42").expect("target válido");
+    let resolved = harness
+        .repo
+        .resolve_scan_target(&harness.owner.user_id, target)
+        .await
+        .expect("resolve no debe fallar")
+        .expect("la IP dentro del CIDR debe matchear");
+
+    assert_eq!(resolved.network_user, "cidr-user");
+    assert_eq!(resolved.ssh_credentials_ref, TEST_SSH_REF);
+    assert!(!resolved.has_sudo);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn resolve_scan_target_prefers_the_most_specific_matching_pattern() {
+    let harness = start_network_credential_test("test-user-cred-3").await;
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "broad",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("el upsert del /24 debe funcionar");
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.0/28",
+            "specific",
+            TEST_SSH_REF,
+            true,
+        )
+        .await
+        .expect("el upsert del /28 debe funcionar");
+
+    let target = parse_target("203.0.113.7").expect("target válido");
+    let resolved = harness
+        .repo
+        .resolve_scan_target(&harness.owner.user_id, target)
+        .await
+        .expect("resolve no debe fallar")
+        .expect("debe matchear");
+
+    assert_eq!(
+        resolved.network_user, "specific",
+        "con dos patrones que matchean, gana el más específico (/28 sobre /24)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn resolve_scan_target_returns_none_when_no_credential_matches() {
+    let harness = start_network_credential_test("test-user-cred-4").await;
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "198.51.100.0/24",
+            "netadmin",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("el upsert de credenciales debe funcionar");
+
+    let target = parse_target("203.0.113.7").expect("target válido");
+    let resolved = harness
+        .repo
+        .resolve_scan_target(&harness.owner.user_id, target)
+        .await
+        .expect("resolve no debe fallar");
+
+    assert_eq!(
+        resolved, None,
+        "ningún patrón matchea un target fuera de la red configurada"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn upsert_network_credential_updates_the_existing_target_pattern_instead_of_duplicating() {
+    let harness = start_network_credential_test("test-user-cred-5").await;
+
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "antes",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("primer upsert");
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "despues",
+            TEST_SSH_REF,
+            true,
+        )
+        .await
+        .expect("segundo upsert sobre el mismo patrón");
+
+    let listed = harness
+        .repo
+        .list_network_credentials(&harness.owner.user_id)
+        .await
+        .expect("list debe funcionar");
+
+    assert_eq!(
+        listed.len(),
+        1,
+        "el upsert no debe duplicar el (user_id, target_pattern)"
+    );
+    assert_eq!(listed[0].network_user, "despues");
+    assert!(listed[0].has_sudo);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn list_network_credentials_is_scoped_to_the_user() {
+    let harness = start_network_credential_test("test-user-cred-6").await;
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "netadmin",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("el upsert de credenciales debe funcionar");
+
+    let listed = harness
+        .repo
+        .list_network_credentials("otro-usuario-que-no-configuro-nada")
+        .await
+        .expect("list no debe fallar");
+
+    assert!(
+        listed.is_empty(),
+        "list solo devuelve credenciales del llamante"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn stored_ssh_reference_is_ciphertext_of_exactly_12_byte_nonce_not_plaintext() {
+    let harness = start_network_credential_test("test-user-cred-7").await;
+    harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &harness.owner.user_id,
+            "203.0.113.9",
+            "netadmin",
+            "credencial-que-no-debe-quedar-en-claro",
+            false,
+        )
+        .await
+        .expect("el upsert de credenciales debe funcionar");
+
+    let row = sqlx::query(
+        "SELECT ssh_credentials_ref_ciphertext, ssh_credentials_ref_nonce \
+         FROM network_credentials WHERE user_id = $1 AND target_pattern = $2",
+    )
+    .bind(&harness.owner.user_id)
+    .bind("203.0.113.9")
+    .fetch_one(&harness.db.app_pool)
+    .await
+    .expect("la fila debe leerse con el rol de aplicación (SELECT otorgado)");
+
+    let ciphertext: Vec<u8> = row.get("ssh_credentials_ref_ciphertext");
+    let nonce: Vec<u8> = row.get("ssh_credentials_ref_nonce");
+
+    assert_eq!(nonce.len(), 12, "nonce AES-256-GCM de 96 bits");
+    assert_ne!(
+        ciphertext, b"credencial-que-no-debe-quedar-en-claro",
+        "la credencial SSH no debe persistirse en claro"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn delete_network_credential_removes_own_entry_and_it_stops_resolving() {
+    let harness = start_network_credential_test("test-user-cred-8").await;
+    let id = Uuid::new_v4();
+    harness
+        .repo
+        .upsert_network_credential(
+            id,
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "netadmin",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("el upsert de credenciales debe funcionar");
+
+    harness
+        .repo
+        .delete_network_credential(id, &harness.owner.user_id)
+        .await
+        .expect("borrar la entrada propia debe funcionar");
+
+    let target = parse_target("203.0.113.7").expect("target válido");
+    let resolved = harness
+        .repo
+        .resolve_scan_target(&harness.owner.user_id, target)
+        .await
+        .expect("resolve no debe fallar");
+
+    assert_eq!(resolved, None, "tras el delete, el objetivo ya no resuelve");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn delete_network_credential_returns_not_found_for_another_users_entry() {
+    let harness = start_network_credential_test("test-user-cred-9-owner").await;
+    let other = sample_profile("test-user-cred-9-other");
+    harness
+        .repo
+        .upsert_user(&other)
+        .await
+        .expect("other debe crearse");
+
+    let owner_id = Uuid::new_v4();
+    harness
+        .repo
+        .upsert_network_credential(
+            owner_id,
+            &harness.owner.user_id,
+            "203.0.113.0/24",
+            "netadmin",
+            TEST_SSH_REF,
+            false,
+        )
+        .await
+        .expect("el upsert del owner debe funcionar");
+
+    let result = harness
+        .repo
+        .delete_network_credential(owner_id, &other.user_id)
+        .await;
+
+    assert!(
+        matches!(result, Err(RepoError::NotFound)),
+        "borrar una entrada ajena debe devolver NotFound (nunca 403 ni Ok): {result:?}"
+    );
+
+    let target = parse_target("203.0.113.7").expect("target válido");
+    let resolved = harness
+        .repo
+        .resolve_scan_target(&harness.owner.user_id, target)
+        .await
+        .expect("resolve no debe fallar");
+    assert!(
+        resolved.is_some(),
+        "la entrada del owner debe seguir intacta tras el delete fallido"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn delete_network_credential_returns_not_found_for_an_unknown_id() {
+    let harness = start_network_credential_test("test-user-cred-10").await;
+
+    let result = harness
+        .repo
+        .delete_network_credential(Uuid::new_v4(), &harness.owner.user_id)
+        .await;
+
+    assert!(matches!(result, Err(RepoError::NotFound)));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn upsert_network_credential_for_an_unknown_user_fails_with_a_constraint_error() {
+    let harness = start_network_credential_test("test-user-cred-11").await;
+
+    let result = harness
+        .repo
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            "usuario-que-no-existe",
+            "203.0.113.0/24",
+            "netadmin",
+            TEST_SSH_REF,
+            false,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(RepoError::Constraint(_))),
+        "la FK user_id debe rechazar credenciales para usuarios inexistentes: {result:?}"
+    );
 }

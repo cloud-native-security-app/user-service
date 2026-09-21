@@ -300,3 +300,75 @@ feature de `feature_list.json` — las 8 quedan `done`.
   verificación de ausencia de shell/toolchain, y el arranque contra un
   Postgres real propio, sin depender únicamente del reporte del
   implementer. Veredicto `APPROVED` en `progress/review_8.md`.
+
+## Sesión — feature 9 (identity_header_contract) — 2026-09-20
+
+**Estado final:** `done`.
+
+- Confirmado el contrato del Gateway (solo lectura de
+  `gateway/src/usuarios_client.rs`): `IdentityHeaderPayload {/*sub*/ /*email*/}` — sub, email — serializado con `serde_json::to_string`.
+- `src/api.rs`: `CallerIdentity` deja de ser un `String` opaco y pasa a
+  `{ sub: String, email: String }` (`Deserialize`), con el parseo
+  factorizado en la función pura `parse_caller_identity(&HeaderMap) ->
+  Option<CallerIdentity>` (header ausente, no-JSON, sin `sub`, o `sub`
+  vacío -> `None` -> `ApiError::MissingIdentity`).
+- Todos los handlers migrados a `identity.sub` como `user_id`.
+- Decisión documentada: `PUT /users/me` toma el `email` de la identidad
+  verificada del header, no del cuerpo (el cuerpo ahora solo usa
+  `display_name`) — nunca confiar en un campo falsificable
+  (`docs/security-scope.md`).
+- Tests existentes migrados a header JSON + 5 tests unitarios nuevos de
+  `parse_caller_identity` + tests de integración actualizados.
+- `./init.sh` verde en 3 corridas consecutivas (fmt/clippy/test/test
+  --ignored/doc).
+
+## Sesión — feature 10 (network_credentials_api) — 2026-09-20
+
+**Estado final:** `done`. Cierra la dependencia pendiente del Gateway
+(`gateway::usuarios_client::resolve_scan_target` →
+`GET /users/me/scan-targets?target=<ip-o-cidr>`).
+
+- `Cargo.toml`: nuevas deps `aes-gcm 0.10` (AES-256-GCM), `ipnetwork 0.20`
+  (parseo/matching de IP/CIDR), `hex 0.4`, `rand 0.8` (nonces); sqlx
+  habilita el tipo `uuid`.
+- `src/config.rs`: nueva variable requerida `CREDENTIALS_ENCRYPTION_KEY`
+  (hex de 64 caracteres → 32 bytes, `SecretSlice<u8>`), con
+  `ConfigError::InvalidEncryptionKey` tipado y tests (faltante, mal
+  formato/longitud, no fuga en `Debug`).
+- Migración `20260920120000_create_network_credentials.sql` (+README):
+  tabla `network_credentials` con `UNIQUE (user_id, target_pattern)`,
+  columnas BYTEA ciphertext+nonce, FK a `users`, `REVOKE` de `PUBLIC` y
+  `GRANT SELECT, INSERT, UPDATE, DELETE` a `ms_usuarios_app` (tabla
+  deliberadamente mutable, a diferencia de `audit_log`).
+- `src/domain.rs`: `NetworkCredential` (metadatos, sin credencial SSH) y
+  `ResolvedScanTarget` (shape EXACTO de 3 campos del contrato Gateway, con
+  `ssh_credentials_ref` redactado en `Debug`).
+- `src/repository.rs`: firma `Repository::new(pool, encryption_key)`;
+  cifrado/descifrado AES-256-GCM privados (nonce aleatorio de 12 bytes por
+  fila); `parse_target` pública (reutilizada por `api` para validar 400);
+  matching privado `network_matches`/`best_target_match` (más específico
+  gana); métodos `upsert_network_credential` (`ON CONFLICT DO UPDATE`),
+  `list_network_credentials`, `delete_network_credential` (0 filas →
+  `NotFound`), `resolve_scan_target`. 8 tests unitarios puros (parseo,
+  matching, round-trip de cifrado, nonces distintos, ciphertext
+  manipulado).
+- `src/api.rs`: 4 endpoints nuevos bajo el mismo middleware
+  `require_gateway_and_identity` (`POST/GET /users/me/network-credentials`,
+  `DELETE /users/me/network-credentials/:id`, `GET /users/me/scan-targets`);
+  `ApiError::BadRequest` (400) y `UnprocessableEntity` (422); delete de
+  una entrada ajena → `404` (nunca `403`).
+- `docker-compose.yml` raíz: `CREDENTIALS_ENCRYPTION_KEY` en el service
+  `user-service` (clave de laboratorio comentada como tal).
+- Docs: `README.md` (nueva env var + tabla de endpoints), `docs/architecture.md`
+  (tabla, cifrado en reposo, "Qué NO hacer"), `docs/security-scope.md`
+  §"Credenciales de red", `AGENTS.md` (límite de seguridad).
+- Verificación: 42 tests unitarios; tests de integración nuevos con
+  Postgres real — 9 en `tests/repository.rs` (upsert/resolve IP exacta,
+  CIDR contenido, más específico gana, sin match → vacío, upsert que
+  actualiza en vez de duplicar, list aislado por usuario, ciphertext no en
+  claro + nonce 12 bytes, delete propio, delete ajeno → NotFound, FK con
+  usuario inexistente) y 8 en `tests/api.rs` por HTTP real (resolución IP
+  exacta y CIDR, 422 sin match, 400 target inválido, 401/400 en scan-targets,
+  list sin la credencial, delete propio → deja de resolver, delete ajeno →
+  404). `./init.sh` verde en 3 corridas consecutivas (fmt/clippy/test/test
+  --ignored/doc).

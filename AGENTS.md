@@ -38,10 +38,10 @@
 - **Documenta lo que haces** en `progress/current.md` mientras trabajas, no al final.
 - **Deja el repositorio limpio** antes de cerrar la sesión (ver §5).
 - **Si no sabes algo, busca en `docs/`** antes de inventarlo.
-- **Antes de tocar identidad de usuario, el log de auditoría o la
-  comunicación Gateway↔ms-usuarios**, lee `docs/security-scope.md`. Si la
-  feature roza esos límites y no está claro cómo proceder, para y pregunta al
-  usuario.
+- **Antes de tocar identidad de usuario, el log de auditoría, las
+  credenciales de red cifradas o la comunicación Gateway↔ms-usuarios**, lee
+  `docs/security-scope.md`. Si la feature roza esos límites y no está claro
+  cómo proceder, para y pregunta al usuario.
 
 ## 4. Cómo elegir una tarea
 

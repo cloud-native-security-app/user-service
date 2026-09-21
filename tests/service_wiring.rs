@@ -23,7 +23,7 @@
 use std::net::SocketAddr;
 
 use reqwest::StatusCode;
-use secrecy::SecretString;
+use secrecy::{SecretSlice, SecretString};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -44,6 +44,14 @@ const TEST_GATEWAY_SECRET: &str = "test-gateway-shared-secret";
 /// `src/api.rs::FORWARDED_USER_HEADER`), duplicado aquí como literal para
 /// no acoplar este test de caja negra a un `use` interno del router.
 const FORWARDED_USER_HEADER: &str = "X-Forwarded-User";
+
+/// Construye el valor JSON del header `X-Forwarded-User` con el mismo shape
+/// que `gateway::usuarios_client::IdentityHeaderPayload` (`{"sub",
+/// "email"}`), confirmado por lectura directa de ese repo hermano (feature
+/// `identity_header_contract`).
+fn identity_header(sub: &str, email: &str) -> String {
+    json!({"sub": sub, "email": email}).to_string()
+}
 
 /// Header con la credencial de servicio Gateway↔`ms-usuarios` (ver
 /// `src/api.rs::GATEWAY_SECRET_HEADER`).
@@ -108,6 +116,7 @@ async fn start_running_service() -> RunningService {
         http_host: "127.0.0.1".to_string(),
         http_port: 0,
         gateway_shared_secret: SecretString::from(TEST_GATEWAY_SECRET.to_string()),
+        credentials_encryption_key: SecretSlice::from(vec![0x07u8; 32]),
         migrations_database_url: superuser_url,
     };
 
@@ -169,14 +178,16 @@ async fn full_flow_create_profile_scan_history_and_audit_over_real_http() {
     let service = start_running_service().await;
     let client = reqwest::Client::new();
     let user_id = "wiring-e2e-user";
+    let identity_header_value = identity_header(user_id, "wiring-e2e-user@example.test");
 
-    // 1. PUT /users/me — crea el perfil del llamante.
+    // 1. PUT /users/me — crea el perfil del llamante. `email` viene de la
+    //    identidad verificada del header, no del cuerpo (feature
+    //    `identity_header_contract`).
     let put_response = client
         .put(format!("{}/users/me", service.base_url))
         .header(GATEWAY_SECRET_HEADER, TEST_GATEWAY_SECRET)
-        .header(FORWARDED_USER_HEADER, user_id)
+        .header(FORWARDED_USER_HEADER, &identity_header_value)
         .json(&json!({
-            "email": "wiring-e2e-user@example.test",
             "display_name": "Wiring E2E User"
         }))
         .send()
@@ -196,7 +207,7 @@ async fn full_flow_create_profile_scan_history_and_audit_over_real_http() {
     let create_scan_response = client
         .post(format!("{}/users/me/scans", service.base_url))
         .header(GATEWAY_SECRET_HEADER, TEST_GATEWAY_SECRET)
-        .header(FORWARDED_USER_HEADER, user_id)
+        .header(FORWARDED_USER_HEADER, &identity_header_value)
         .json(&json!({"target": "192.0.2.100"}))
         .send()
         .await
@@ -220,7 +231,7 @@ async fn full_flow_create_profile_scan_history_and_audit_over_real_http() {
     let history_response = client
         .get(format!("{}/users/me/scans", service.base_url))
         .header(GATEWAY_SECRET_HEADER, TEST_GATEWAY_SECRET)
-        .header(FORWARDED_USER_HEADER, user_id)
+        .header(FORWARDED_USER_HEADER, &identity_header_value)
         .send()
         .await
         .expect("GET /users/me/scans no debe fallar a nivel de transporte");
@@ -240,7 +251,7 @@ async fn full_flow_create_profile_scan_history_and_audit_over_real_http() {
     let audit_response = client
         .get(format!("{}/users/me/audit", service.base_url))
         .header(GATEWAY_SECRET_HEADER, TEST_GATEWAY_SECRET)
-        .header(FORWARDED_USER_HEADER, user_id)
+        .header(FORWARDED_USER_HEADER, &identity_header_value)
         .send()
         .await
         .expect("GET /users/me/audit no debe fallar a nivel de transporte");

@@ -1,5 +1,5 @@
 //! Handlers y router HTTP (`axum`) del servicio: perfil de usuario,
-//! histórico de escaneos y auditoría.
+//! histórico de escaneos, auditoría y credenciales de red.
 //!
 //! Expone `PUT /users/me` (crea o actualiza el perfil del llamante) y
 //! `GET /users/me` (consulta el perfil del llamante), además de:
@@ -15,6 +15,23 @@
 //!   llamante (autorización a nivel de fila, ver `docs/security-scope.md`).
 //! - `GET /users/me/scans` (RF-13): histórico de escaneos del llamante.
 //! - `GET /users/me/audit` (RF-15): entradas de auditoría del llamante.
+//! - `POST /users/me/network-credentials` (feature `network_credentials_api`,
+//!   id 10): crea o actualiza (upsert por `user_id` + `target_pattern`) las
+//!   credenciales de red del llamante para un objetivo (IP exacta o CIDR,
+//!   v4 o v6). Acepta `ssh_credentials_ref`, pero la respuesta NUNCA la
+//!   devuelve (se cifra en reposo, ver `docs/security-scope.md` §"Credenciales
+//!   de red").
+//! - `GET /users/me/network-credentials`: lista las credenciales de red del
+//!   llamante, sin la credencial SSH.
+//! - `DELETE /users/me/network-credentials/{id}`: borra una entrada propia;
+//!   un `id` inexistente **o de otro usuario** responde `404` (nunca `403`,
+//!   para no revelar a quién pertenece la entrada).
+//! - `GET /users/me/scan-targets?target={ip|ip/cidr}`: resuelve las
+//!   credenciales de red que mejor matchean el objetivo, en el shape EXACTO
+//!   que espera `gateway::usuarios_client::ScanTargetCredentials`
+//!   (`{network_user, ssh_credentials_ref, has_sudo}`). `400` si `target` no
+//!   es IP ni CIDR, `422` si el llamante no tiene credenciales que matcheen.
+//!   Es el ÚNICO endpoint que devuelve `ssh_credentials_ref` en claro.
 //!
 //! ## Autenticación de cada petición
 //!
@@ -29,10 +46,14 @@
 //!   `401 Unauthorized`, comparada en tiempo constante para no filtrar el
 //!   secreto por un ataque de temporización.
 //! - [`FORWARDED_USER_HEADER`] (`X-Forwarded-User`): la identidad del
-//!   usuario final ya verificada por el Gateway/IDaaS (p. ej. el `sub` de
-//!   Google, RF-01). Es el **único** origen de verdad de `user_id` — nunca
+//!   usuario final ya verificada por el Gateway/IDaaS, serializada como
+//!   JSON `{"sub": "...", "email": "..."}` — mismo shape que
+//!   `gateway::usuarios_client::IdentityHeaderPayload` (confirmado en el
+//!   código de ese repo hermano). El campo `sub` (p. ej. el `sub` de
+//!   Google, RF-01) es el **único** origen de verdad de `user_id` — nunca
 //!   se confía en un `user_id` que venga en el cuerpo o en la query de la
-//!   petición. Ausente → `400 Bad Request`.
+//!   petición. Header ausente, vacío, no-JSON, sin `sub`, o con `sub`
+//!   vacío → `400 Bad Request`.
 //!
 //! [`router`] construye el `Router` completo (con este middleware ya
 //! aplicado) a partir de un [`Repository`] y el secreto de servicio, para
@@ -41,7 +62,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -53,8 +74,10 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::domain::{AuditEntry, ScanHistoryEntry, ScanStatus, UserProfile};
-use crate::repository::{RepoError, Repository};
+use crate::domain::{
+    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus, UserProfile,
+};
+use crate::repository::{parse_target, RepoError, Repository};
 
 /// Acción de auditoría registrada por [`create_scan`] junto con cada nueva
 /// entrada de histórico (RF-15).
@@ -98,6 +121,15 @@ pub fn router(repository: Repository, gateway_shared_secret: SecretString) -> Ro
         .route("/users/me/scans", get(list_scans).post(create_scan))
         .route("/users/me/audit", get(list_audit))
         .route("/scans/:scan_id", axum::routing::patch(patch_scan_status))
+        .route(
+            "/users/me/network-credentials",
+            get(list_network_credentials).post(upsert_network_credential),
+        )
+        .route(
+            "/users/me/network-credentials/:id",
+            axum::routing::delete(delete_network_credential),
+        )
+        .route("/users/me/scan-targets", get(resolve_scan_target))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_gateway_and_identity,
@@ -105,11 +137,20 @@ pub fn router(repository: Repository, gateway_shared_secret: SecretString) -> Ro
         .with_state(state)
 }
 
-/// Identidad del llamante, ya verificada por [`require_gateway_and_identity`]
-/// e inyectada en las extensiones de la petición para que los handlers la
-/// consuman vía el extractor [`Extension`].
-#[derive(Clone)]
-struct CallerIdentity(String);
+/// Identidad del llamante, ya verificada por el Gateway/IDaaS y reenviada
+/// como JSON en el header [`FORWARDED_USER_HEADER`] — mismo shape que
+/// `gateway::usuarios_client::IdentityHeaderPayload` (`{"sub", "email"}`).
+/// Poblada por [`parse_caller_identity`] e inyectada en las extensiones de
+/// la petición por [`require_gateway_and_identity`] para que los handlers
+/// la consuman vía el extractor [`Extension`].
+#[derive(Clone, Deserialize)]
+struct CallerIdentity {
+    /// Identificador estable del usuario (p. ej. el `sub` de Google,
+    /// RF-01). Único origen de verdad de `user_id` en toda la API.
+    sub: String,
+    /// Email verificado del usuario, tal como lo reenvía el Gateway.
+    email: String,
+}
 
 /// Middleware que exige, en orden, la credencial de servicio y el header de
 /// identidad — antes de que la petición llegue a cualquier handler y, por
@@ -126,15 +167,12 @@ async fn require_gateway_and_identity(
         return ApiError::Unauthorized.into_response();
     }
 
-    let forwarded_user =
-        read_header(request.headers(), FORWARDED_USER_HEADER).map(|value| value.trim().to_string());
-
-    match forwarded_user {
-        Some(user_id) if !user_id.is_empty() => {
-            request.extensions_mut().insert(CallerIdentity(user_id));
+    match parse_caller_identity(request.headers()) {
+        Some(identity) => {
+            request.extensions_mut().insert(identity);
             next.run(request).await
         }
-        _ => ApiError::MissingIdentity.into_response(),
+        None => ApiError::MissingIdentity.into_response(),
     }
 }
 
@@ -142,6 +180,25 @@ async fn require_gateway_and_identity(
 /// es UTF-8 válido (nunca hace `panic!`).
 fn read_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
+}
+
+/// Extrae y valida la identidad del llamante desde
+/// [`FORWARDED_USER_HEADER`]: el valor debe ser JSON válido con la forma
+/// `{"sub", "email"}` (mismo shape que
+/// `gateway::usuarios_client::IdentityHeaderPayload`).
+///
+/// Devuelve `None` — nunca hace `panic!` — cuando el header está ausente,
+/// no es UTF-8 válido, no es JSON válido, el JSON no trae `sub`, o `sub` es
+/// una cadena vacía (un `sub` vacío se trata como identidad ausente). Es
+/// una función pura sin dependencia de estado ni IO, así que se testea
+/// directamente sin necesidad de Docker/Postgres.
+fn parse_caller_identity(headers: &HeaderMap) -> Option<CallerIdentity> {
+    let raw = read_header(headers, FORWARDED_USER_HEADER)?;
+    let identity: CallerIdentity = serde_json::from_str(raw).ok()?;
+    if identity.sub.is_empty() {
+        return None;
+    }
+    Some(identity)
 }
 
 /// Compara `provided` contra el secreto de servicio configurado en tiempo
@@ -160,25 +217,31 @@ fn secrets_match(provided: &str, expected: &SecretString) -> bool {
 
 /// Cuerpo de la petición `PUT /users/me`.
 ///
-/// Deliberadamente no incluye `user_id`: la identidad del perfil upserteado
-/// es siempre la del header [`FORWARDED_USER_HEADER`], nunca un valor que
-/// el llamante pudiera pasar en el cuerpo.
+/// Deliberadamente no incluye `user_id` ni `email`: ambos vienen siempre de
+/// la identidad ya verificada en el header [`FORWARDED_USER_HEADER`]
+/// ([`CallerIdentity`]), nunca de un valor que el llamante pudiera pasar en
+/// el cuerpo. Antes de la feature `identity_header_contract` este handler
+/// tomaba `email` del cuerpo de la petición; se corrigió porque el email
+/// es parte de la identidad verificada por el Gateway y nunca debe
+/// aceptarse desde un campo que el llamante puede falsificar (ver
+/// `docs/security-scope.md`) — esto cambia el contrato observable de
+/// `PUT /users/me`: un cuerpo que incluya `email` lo ignora silenciosamente.
 #[derive(Debug, Deserialize)]
 struct UpsertProfileRequest {
-    email: String,
     display_name: String,
 }
 
 /// `PUT /users/me` — crea el perfil del llamante si no existe, o actualiza
-/// `email`/`display_name` si ya existía.
+/// `email`/`display_name` si ya existía. `email` se toma de la identidad
+/// verificada (`X-Forwarded-User`), no del cuerpo de la petición.
 async fn put_profile(
     State(state): State<AppState>,
     Extension(identity): Extension<CallerIdentity>,
     Json(payload): Json<UpsertProfileRequest>,
 ) -> Result<Json<UserProfile>, ApiError> {
     let profile = UserProfile {
-        user_id: identity.0,
-        email: payload.email,
+        user_id: identity.sub,
+        email: identity.email,
         display_name: payload.display_name,
         created_at: Utc::now(),
     };
@@ -208,7 +271,7 @@ async fn get_profile(
 ) -> Result<Json<UserProfile>, ApiError> {
     let profile = state
         .repository
-        .find_user(&identity.0)
+        .find_user(&identity.sub)
         .await
         .map_err(ApiError::from)?;
 
@@ -238,7 +301,7 @@ async fn create_scan(
     let now = Utc::now();
     let entry = ScanHistoryEntry {
         scan_id: Uuid::new_v4().to_string(),
-        user_id: identity.0.clone(),
+        user_id: identity.sub.clone(),
         target: payload.target.clone(),
         status: ScanStatus::Pendiente,
         requested_at: now,
@@ -246,7 +309,7 @@ async fn create_scan(
     };
     let audit_entry = AuditEntry::new(
         Uuid::new_v4().to_string(),
-        identity.0,
+        identity.sub,
         payload.target,
         SCAN_REQUESTED_ACTION,
         now,
@@ -272,7 +335,7 @@ struct UpdateScanStatusRequest {
 /// `ms-nmap`/`ms-analisis`).
 ///
 /// Autorización a nivel de fila (ver `docs/security-scope.md`): el
-/// `scan_id` de la URL debe pertenecer a `identity.0`, igual que cualquier
+/// `scan_id` de la URL debe pertenecer a `identity.sub`, igual que cualquier
 /// otro handler que reciba un identificador en la URL. Un `scan_id`
 /// inexistente responde `404 Not Found`; uno que existe pero pertenece a
 /// otro usuario responde `403 Forbidden` (un `id` que no coincide nunca es
@@ -290,7 +353,7 @@ async fn patch_scan_status(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
 
-    if owner != identity.0 {
+    if owner != identity.sub {
         return Err(ApiError::Forbidden);
     }
 
@@ -313,7 +376,7 @@ async fn list_scans(
 ) -> Result<Json<Vec<ScanHistoryEntry>>, ApiError> {
     let history = state
         .repository
-        .list_scan_history(&identity.0)
+        .list_scan_history(&identity.sub)
         .await
         .map_err(ApiError::from)?;
 
@@ -328,11 +391,131 @@ async fn list_audit(
 ) -> Result<Json<Vec<AuditEntry>>, ApiError> {
     let entries = state
         .repository
-        .list_audit_entries(&identity.0)
+        .list_audit_entries(&identity.sub)
         .await
         .map_err(ApiError::from)?;
 
     Ok(Json(entries))
+}
+
+/// Cuerpo de la petición `POST /users/me/network-credentials` (feature
+/// `network_credentials_api`).
+///
+/// Deliberadamente no incluye `user_id` (siempre el del header
+/// [`FORWARDED_USER_HEADER`]) ni `id` (lo genera este servicio): el llamante
+/// solo decide el objetivo (`target_pattern`, IP exacta o CIDR v4/v6), las
+/// credenciales de red (`network_user`, `ssh_credentials_ref`) y el flag de
+/// `sudo` para ese objetivo.
+#[derive(Debug, Deserialize)]
+struct UpsertNetworkCredentialRequest {
+    target_pattern: String,
+    network_user: String,
+    ssh_credentials_ref: String,
+    has_sudo: bool,
+}
+
+/// `POST /users/me/network-credentials` — crea o actualiza (upsert por
+/// `user_id` + `target_pattern`) las credenciales de red del llamante para
+/// un objetivo. La credencial SSH (`ssh_credentials_ref`) se persiste cifrada
+/// en reposo y la respuesta `200 OK` [`NetworkCredential`] **no** la
+/// contiene; el único endpoint que la devuelve en claro es
+/// [`resolve_scan_target`] (`GET /users/me/scan-targets`), por contrato del
+/// Gateway (ver `docs/security-scope.md` §"Credenciales de red").
+async fn upsert_network_credential(
+    State(state): State<AppState>,
+    Extension(identity): Extension<CallerIdentity>,
+    Json(payload): Json<UpsertNetworkCredentialRequest>,
+) -> Result<Json<NetworkCredential>, ApiError> {
+    let saved = state
+        .repository
+        .upsert_network_credential(
+            Uuid::new_v4(),
+            &identity.sub,
+            &payload.target_pattern,
+            &payload.network_user,
+            &payload.ssh_credentials_ref,
+            payload.has_sudo,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(saved))
+}
+
+/// `GET /users/me/network-credentials` — devuelve las credenciales de red
+/// del llamante (nunca las de otro usuario), sin la credencial SSH.
+async fn list_network_credentials(
+    State(state): State<AppState>,
+    Extension(identity): Extension<CallerIdentity>,
+) -> Result<Json<Vec<NetworkCredential>>, ApiError> {
+    let credentials = state
+        .repository
+        .list_network_credentials(&identity.sub)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(credentials))
+}
+
+/// `DELETE /users/me/network-credentials/{id}` — borra una entrada propia.
+///
+/// Autorización a nivel de fila: el `id` de la URL debe pertenecer a
+/// `identity.sub`. Un `id` inexistente **o de otro usuario** responde `404
+/// Not Found` — nunca `403`, para no revelar a quién pertenece la entrada
+/// (decisión explícita de la feature `network_credentials_api`; contrasta
+/// con `PATCH /scans/{scan_id}`).
+async fn delete_network_credential(
+    State(state): State<AppState>,
+    Extension(identity): Extension<CallerIdentity>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id = Uuid::parse_str(&id).map_err(|_| ApiError::BadRequest)?;
+
+    match state
+        .repository
+        .delete_network_credential(id, &identity.sub)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(RepoError::NotFound) => Err(ApiError::NotFound),
+        Err(other) => Err(ApiError::from(other)),
+    }
+}
+
+/// Query params de `GET /users/me/scan-targets`.
+#[derive(Debug, Deserialize)]
+struct ResolveScanTargetParams {
+    target: String,
+}
+
+/// `GET /users/me/scan-targets?target={ip|ip/cidr}` — resuelve las
+/// credenciales de red del llamante para el objetivo `target` (IP exacta o
+/// CIDR, v4 o v6).
+///
+/// `target` se valida en el borde con [`parse_target`] (función
+/// pura compartida con el repositorio): inválido → `400 Bad Request`. Si el
+/// llamante no tiene ninguna entrada que matchee → `422 Unprocessable
+/// Entity`. En caso de varias, gana la del patrón más específico (prefijo
+/// más largo, ver `Repository::resolve_scan_target`).
+///
+/// Es el **único** endpoint que devuelve `ssh_credentials_ref` en claro, en
+/// el shape EXACTO de 3 campos que espera
+/// `gateway::usuarios_client::ScanTargetCredentials`.
+async fn resolve_scan_target(
+    State(state): State<AppState>,
+    Extension(identity): Extension<CallerIdentity>,
+    Query(params): Query<ResolveScanTargetParams>,
+) -> Result<Json<ResolvedScanTarget>, ApiError> {
+    let target = parse_target(&params.target).ok_or(ApiError::BadRequest)?;
+
+    let resolved = state
+        .repository
+        .resolve_scan_target(&identity.sub, target)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::UnprocessableEntity)?;
+
+    Ok(Json(resolved))
 }
 
 /// Error de la API HTTP de este módulo.
@@ -348,6 +531,16 @@ enum ApiError {
     /// Falta el header de identidad reenviado por el Gateway.
     #[error("falta el header de identidad del llamante")]
     MissingIdentity,
+    /// La petición tiene un formato inválido: un `target` que no es IP ni
+    /// CIDR (v4/v6) en `GET /users/me/scan-targets`, o un `id` no-UUID en
+    /// `DELETE /users/me/network-credentials/{id}`. El mensaje no incluye el
+    /// valor rechazado (puede contener datos sensibles).
+    #[error("formato inválido en la petición (target o id no válidos)")]
+    BadRequest,
+    /// El llamante no tiene credenciales de red que matcheen el objetivo
+    /// consultado en `GET /users/me/scan-targets`.
+    #[error("no se encontraron credenciales de red para el objetivo")]
+    UnprocessableEntity,
     /// El perfil solicitado no existe.
     #[error("el perfil solicitado no existe")]
     NotFound,
@@ -363,6 +556,10 @@ impl From<RepoError> for ApiError {
     /// Traduce cualquier fallo de `repository` a un error interno genérico:
     /// el mensaje de [`RepoError`] nunca llega al cuerpo de la respuesta, ya
     /// que el objetivo es no exponer detalle de infraestructura al llamante.
+    ///
+    /// Los handlers que necesitan distinguir un [`RepoError::NotFound`] lo
+    /// hacen con un `match` explícito antes de delegar aquí (p. ej.
+    /// [`patch_scan_status`] o [`delete_network_credential`]).
     fn from(_: RepoError) -> Self {
         ApiError::Internal
     }
@@ -373,6 +570,8 @@ impl IntoResponse for ApiError {
         let status = match self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::MissingIdentity => StatusCode::BAD_REQUEST,
+            ApiError::BadRequest => StatusCode::BAD_REQUEST,
+            ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Forbidden => StatusCode::FORBIDDEN,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -438,5 +637,49 @@ mod tests {
             read_header(&headers, FORWARDED_USER_HEADER),
             Some("google-oauth2|123456")
         );
+    }
+
+    #[test]
+    fn parse_caller_identity_returns_sub_and_email_for_valid_json() {
+        let headers = header_map(
+            FORWARDED_USER_HEADER,
+            r#"{"sub":"google-oauth2|123456","email":"user@example.test"}"#,
+        );
+
+        let identity = parse_caller_identity(&headers).expect("un header JSON válido debe parsear");
+
+        assert_eq!(identity.sub, "google-oauth2|123456");
+        assert_eq!(identity.email, "user@example.test");
+    }
+
+    #[test]
+    fn parse_caller_identity_returns_none_when_header_is_absent() {
+        let headers = HeaderMap::new();
+
+        assert!(parse_caller_identity(&headers).is_none());
+    }
+
+    #[test]
+    fn parse_caller_identity_returns_none_for_non_json_header() {
+        let headers = header_map(FORWARDED_USER_HEADER, "not-json-at-all");
+
+        assert!(parse_caller_identity(&headers).is_none());
+    }
+
+    #[test]
+    fn parse_caller_identity_returns_none_when_sub_is_missing() {
+        let headers = header_map(FORWARDED_USER_HEADER, r#"{"email":"user@example.test"}"#);
+
+        assert!(parse_caller_identity(&headers).is_none());
+    }
+
+    #[test]
+    fn parse_caller_identity_returns_none_when_sub_is_empty() {
+        let headers = header_map(
+            FORWARDED_USER_HEADER,
+            r#"{"sub":"","email":"user@example.test"}"#,
+        );
+
+        assert!(parse_caller_identity(&headers).is_none());
     }
 }

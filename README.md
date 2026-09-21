@@ -57,6 +57,7 @@ un error tipado explícito, nunca con un panic:
 | `HTTP_HOST` | Sí | Host en el que el servidor HTTP hace bind (p. ej. `0.0.0.0` dentro del contenedor) |
 | `HTTP_PORT` | Sí | Puerto en el que el servidor HTTP hace bind |
 | `GATEWAY_SHARED_SECRET` | Sí | Credencial compartida que autentica al Gateway como llamante de este servicio (ver `docs/security-scope.md`) |
+| `CREDENTIALS_ENCRYPTION_KEY` | Sí | Clave de cifrado en reposo (AES-256-GCM) de las credenciales SSH de red (feature `network_credentials_api`): 32 bytes codificados como hex de 64 caracteres. Tan sensible como `GATEWAY_SHARED_SECRET` — no debe commitearse ni loggearse (ver `docs/security-scope.md` §"Credenciales de red") |
 | `MIGRATIONS_DATABASE_URL` | No (cae de vuelta a `DATABASE_URL` si está ausente) | URL de conexión usada **exclusivamente** para aplicar las migraciones al arrancar, con el rol "dueño" de las tablas |
 
 `MIGRATIONS_DATABASE_URL` existe porque `migrations/20260918120100_lock_audit_log_permissions.sql`
@@ -79,6 +80,33 @@ docker run --rm \
   -e HTTP_HOST=0.0.0.0 \
   -e HTTP_PORT=8080 \
   -e GATEWAY_SHARED_SECRET=change-me \
+  -e CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -p 8080:8080 \
   user-service:local
 ```
+
+## API
+
+Todas las rutas requieren dos headers en cada petición, verificados por un
+middleware interno antes de tocar la base de datos (ver
+`docs/security-scope.md`):
+
+- `X-Gateway-Secret`: la credencial de servicio compartida
+  (`GATEWAY_SHARED_SECRET`). Ausente o incorrecta → `401`.
+- `X-Forwarded-User`: la identidad del usuario final ya verificada por el
+  Gateway, como JSON `{"sub": "...", "email": "..."}`. Ausente/inválida →
+  `400`. El `sub` es el único origen de verdad de `user_id`: nunca se
+  confía en un `user_id` del cuerpo o la query.
+
+| Método y ruta | Descripción |
+|---------------|-------------|
+| `PUT /users/me` | Crea o actualiza el perfil del llamante. Cuerpo: `{"display_name": "..."}` |
+| `GET /users/me` | Perfil del llamante; `404` si aún no tiene perfil |
+| `POST /users/me/scans` | Registra una solicitud de escaneo (estado `Pendiente`) + su auditoría, en la misma transacción. Cuerpo: `{"target": "..."}` |
+| `GET /users/me/scans` | Histórico de escaneos del llamante |
+| `PATCH /scans/{scan_id}` | Actualiza el estado de una solicitud propia; `404` si no existe, `403` si es de otro usuario |
+| `GET /users/me/audit` | Auditoría del llamante (RF-15) |
+| `POST /users/me/network-credentials` | Crea/actualiza (upsert por `user_id`+`target_pattern`) las credenciales de red del llamante para un objetivo. Cuerpo: `{"target_pattern": "203.0.113.7" \| "203.0.113.0/24" (IP o CIDR v4/v6), "network_user": "...", "ssh_credentials_ref": "...", "has_sudo": bool}`. `ssh_credentials_ref` se cifra en reposo y **nunca** aparece en la respuesta |
+| `GET /users/me/network-credentials` | Credenciales de red del llamante, sin la credencial SSH |
+| `DELETE /users/me/network-credentials/{id}` | Borra una entrada propia; un `id` ajeno o inexistente → `404` (nunca `403`) |
+| `GET /users/me/scan-targets?target=<ip\|ip/cidr>` | Resuelve las credenciales que mejor matchean el objetivo (más específico gana). `400` si `target` no es IP/CIDR, `422` si no hay match. Respuesta EXACTA: `{"network_user": "...", "ssh_credentials_ref": "...", "has_sudo": bool}` — el shape que consume `gateway::usuarios_client::ScanTargetCredentials`. Único endpoint que devuelve la credencial SSH |
