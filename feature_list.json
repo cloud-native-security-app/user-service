@@ -21,7 +21,7 @@
         "Existe migrations/ (vacío o con un README) preparado para las migraciones de sqlx de la feature postgres_persistence",
         "cargo build compila sin warnings"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 2,
@@ -34,7 +34,7 @@
         "Ningún valor de configuración queda hardcodeado en el código",
         "Test cubre: config válida se carga correctamente; falta una variable requerida produce un error tipado; Debug no filtra la credencial"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 3,
@@ -49,13 +49,14 @@
         "Ningún tipo de este módulo permite construir una instancia con datos parcialmente inválidos silenciosamente (p. ej. un ScanStatus fuera de las 4 variantes no compila)",
         "Test unitario cubre (de)serialización round-trip de cada tipo y el encoding estable de ScanStatus"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 4,
       "name": "postgres_persistence",
       "title": "Persistencia en PostgreSQL (db-usuarios)",
       "description": "Migraciones versionadas y repositorio sqlx para perfiles, histórico de escaneos y auditoría. La tabla de auditoría se refuerza a nivel de base de datos para que solo admita INSERT/SELECT.",
+      "status": "done",
       "acceptance": [
         "migrations/ contiene migraciones sqlx versionadas que crean las tablas users, scan_history y audit_log, con las claves foráneas correspondientes (scan_history.user_id -> users, audit_log.user_id -> users)",
         "Una migración crea un rol/grant de base de datos (o revoca privilegios del rol de aplicación) tal que audit_log solo admite INSERT y SELECT — un intento de UPDATE/DELETE contra esa tabla con el rol de aplicación falla por permisos, no por lógica de la aplicación",
@@ -65,14 +66,14 @@
         "Un id/usuario inexistente en una consulta devuelve Ok(None) o Vec vacío, nunca un error",
         "Fallos de conexión a Postgres son un RepoError distinguible, no un panic",
         "Tests de integración corren contra el contenedor PostgreSQL oficial levantado vía testcontainers (migraciones aplicadas al arrancar), marcados #[ignore = \"requiere Docker\"]: upsert+find de usuario, insert+list de histórico, transición de estado, append+lectura de auditoría, y el intento explícito de UPDATE/DELETE directo sobre audit_log que debe fallar por permisos"
-      ],
-      "status": "pending"
+      ]
     },
     {
       "id": 5,
       "name": "user_profile_api",
       "title": "API HTTP: perfil de usuario",
       "description": "Endpoints axum para crear/actualizar y consultar el perfil de un usuario, autorizados a nivel de fila contra la identidad reenviada por el Gateway.",
+      "status": "done",
       "acceptance": [
         "src/api.rs (o un submódulo) expone PUT /users/me (upsert del perfil del llamante) y GET /users/me (perfil del llamante) usando axum",
         "Cada handler exige un header de identidad reenviado por el Gateway (p. ej. X-Forwarded-User o equivalente, nombre exacto documentado en rustdoc) y lo usa como único origen de verdad de user_id — nunca confía en un user_id del cuerpo/query",
@@ -80,8 +81,7 @@
         "Ausencia del header de identidad responde 400/401 explícito, nunca un panic ni un 500 genérico",
         "Ningún mensaje de error ni log de esta feature incluye el email o nombre del usuario (ver docs/security-scope.md)",
         "Tests de integración (#[ignore = \"requiere Docker\"], contenedor Postgres real): upsert crea el perfil, GET posterior lo refleja, falta la credencial de servicio -> 401, falta el header de identidad -> 400/401"
-      ],
-      "status": "pending"
+      ]
     },
     {
       "id": 6,
@@ -96,7 +96,7 @@
         "Las mismas reglas de autorización por header de identidad + credencial de servicio de la feature user_profile_api aplican a todas las rutas de esta feature",
         "Tests de integración (#[ignore = \"requiere Docker\"]): registrar escaneo crea histórico + auditoría atómicamente; actualizar estado se refleja en GET /users/me/scans; scan_id inexistente en PATCH -> 404; un usuario no puede leer el histórico/auditoría de otro (probado con dos identidades distintas)"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 7,
@@ -110,7 +110,7 @@
         "Un test de integración end-to-end (#[ignore = \"requiere Docker\"]) levanta el servicio real sobre un Postgres de test y ejerce el flujo completo: crear perfil -> registrar escaneo -> consultar histórico -> consultar auditoría, todo vía HTTP real (no llamando a los handlers como funciones sueltas)",
         "Un fallo de Postgres al arrancar (migraciones o conexión) se reporta con un error explícito y el proceso no arranca a medias"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 8,
@@ -127,7 +127,44 @@
         "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
         "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no)"
       ],
-      "status": "pending"
+      "status": "done"
+    },
+    {
+      "id": 9,
+      "name": "identity_header_contract",
+      "title": "Corregir el parseo de X-Forwarded-User al contrato real de gateway",
+      "description": "gateway (repo hermano, src/usuarios_client.rs) ya serializa la identidad verificada como JSON `{\"sub\":\"...\",\"email\":\"...\"}` en el header X-Forwarded-User -confirmado en su código, no es una suposición-, pero el middleware require_gateway_and_identity de este repo trata hoy el header completo como un string opaco (CallerIdentity(String)) y lo usa tal cual como user_id. En producción esto guardaría el JSON entero como identificador de usuario en vez de el `sub` real. Se corrige ahora, antes de la feature network_credentials_api, porque esa API necesita el `sub` limpio como clave de las credenciales de red guardadas. Toca código de las features ya done user_profile_api y scan_history_api: se tratan como regresión a re-verificar, no como reescritura libre.",
+      "acceptance": [
+        "CallerIdentity pasa a llevar sub: String y email: String (o se sustituye por un tipo equivalente), poblado deserializando el header X-Forwarded-User como JSON {\"sub\",\"email\"} -mismo shape que gateway::usuarios_client::IdentityHeaderPayload-",
+        "Header ausente, vacío, no-JSON, o JSON sin `sub` -> ApiError::MissingIdentity (mismo tipo de error que ya existe), nunca panic. Un `sub` vacío también se trata como identidad ausente",
+        "user_id almacenado en users/scan_history/audit_log pasa a ser el `sub` (no el JSON completo); ninguna tabla ni columna nueva hace falta, es el mismo campo que ya existe",
+        "email del header queda disponible para los handlers que ya lo usan (p. ej. al upsertear el perfil, si hoy dependen de que el cuerpo de la petición traiga el email, evaluar si en vez debe tomarse del header -decidir y documentar-)",
+        "Todos los tests existentes de user_profile_api y scan_history_api se actualizan a construir el header en el nuevo formato JSON y siguen verdes sin cambio de comportamiento observable más allá del propio fix",
+        "Nuevos tests: header JSON válido -> CallerIdentity correcto; header no-JSON -> MissingIdentity; header JSON sin sub -> MissingIdentity; sub vacío -> MissingIdentity",
+        "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en el resto de features"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 10,
+      "name": "network_credentials_api",
+      "title": "API de credenciales de red por usuario/objetivo (cierra la dependencia pendiente de gateway)",
+      "description": "gateway::usuarios_client::resolve_scan_target ya llama a GET /users/me/scan-targets?target=<ip-o-cidr> esperando {network_user, ssh_credentials_ref, has_sudo} (200), o 422 si no hay credenciales configuradas para ese usuario/objetivo -ver gateway/docs/architecture.md §Dependencia pendiente y gateway/src/usuarios_client.rs::resolve_scan_target-. Esa API no existe hoy en user-service (0 referencias a esos campos), por lo que POST /api/scans en gateway responde 501. Esta feature la implementa, junto con el CRUD mínimo para que el usuario pueda configurar esas credenciales -sin eso la API de resolución nunca tendría nada que devolver-. ssh_credentials_ref es una credencial SSH real hacia infraestructura de terceros (no un secreto de laboratorio): se cifra en reposo.",
+      "acceptance": [
+        "Nueva tabla Postgres network_credentials(id uuid pk, user_id text, target_pattern text, network_user text, ssh_credentials_ref_ciphertext bytea, ssh_credentials_ref_nonce bytea, has_sudo boolean, created_at, updated_at), con índice/constraint de unicidad (user_id, target_pattern)",
+        "target_pattern acepta una IP exacta o un CIDR (v4 o v6); se valida en el borde (400 si no es ninguna de las dos), usando un crate de parseo de IP/CIDR ya existente en el ecosistema Rust (p. ej. ipnetwork o el propio std::net + un crate de CIDR) en vez de reimplementar el parseo a mano",
+        "ssh_credentials_ref se cifra en reposo con AES-256-GCM (crate aes-gcm) antes de persistir: nonce aleatorio por fila, clave de cifrado desde una variable de entorno nueva y requerida (p. ej. CREDENTIALS_ENCRYPTION_KEY, 32 bytes, documentada en README junto al resto de env vars de config.rs), nunca hardcodeada. Se descifra solo en el momento de responder GET /users/me/scan-targets, nunca se loggea el valor en claro",
+        "POST /users/me/network-credentials (autenticado, mismo middleware require_gateway_and_identity): crea o actualiza (upsert por user_id+target_pattern) una entrada. Cuerpo: {target_pattern, network_user, ssh_credentials_ref, has_sudo}. Nunca devuelve ssh_credentials_ref en la respuesta (ni en claro ni cifrado)",
+        "GET /users/me/network-credentials (autenticado): lista las entradas del usuario activo, sin ssh_credentials_ref (campo omitido u omitido explícitamente, nunca placeholder inventado)",
+        "DELETE /users/me/network-credentials/:id (autenticado): borra una entrada propia del usuario activo; borrar una entrada de otro usuario -aunque el id exista- responde 404, nunca 403 con detalle de a quién pertenece",
+        "GET /users/me/scan-targets?target=<ip-o-cidr> (autenticado): resuelve la entrada de network_credentials del usuario activo que mejor matchea target -match exacto de target_pattern si target es una IP contenida en él, o si son el mismo CIDR; si varias entradas matchean, la de target_pattern más específico (prefijo más largo) gana-. Responde 200 con {network_user, ssh_credentials_ref (descifrado), has_sudo} si hay match, 422 si no hay ninguna entrada que matchee. Shape de la respuesta EXACTO al que ya espera gateway::usuarios_client::ScanTargetCredentials -mismos 3 nombres de campo-",
+        "400 si el `target` de la query no es una IP ni un CIDR válido",
+        "Los 4 endpoints nuevos quedan documentados en README.md igual que los existentes, y docs/architecture.md describe la nueva tabla y el cifrado en reposo. docs/security-scope.md se actualiza: ssh_credentials_ref es una credencial real (no de laboratorio), se cifra en reposo, nunca se loggea ni se devuelve en list/create, la clave de cifrado es configuración sensible como GATEWAY_SHARED_SECRET",
+        "Tests unitarios (sin Docker): matching de CIDR (exacto, contenido, más específico gana, sin match -> None), validación de target inválido, cifrado/descifrado round-trip con nonces distintos por fila",
+        "Tests de integración (#[ignore = \"requiere Docker\"], testcontainers Postgres real): crear credencial -> resolver por IP exacta -> 200 con los 3 campos correctos; crear para un CIDR -> resolver una IP dentro de él -> 200; sin credenciales configuradas -> 422; borrar -> ya no resuelve; borrar una entrada ajena -> 404; smoke end-to-end vía HTTP real (mismo patrón que la feature service_wiring), no llamando handlers como funciones sueltas",
+        "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en el resto de features. Depende de que la feature identity_header_contract esté done primero (usa CallerIdentity.sub)"
+      ],
+      "status": "done"
     }
   ]
 }
