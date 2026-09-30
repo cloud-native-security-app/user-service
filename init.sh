@@ -41,7 +41,7 @@ ok "rustc -> $(rustc --version)"
 echo ""
 echo "── 2. Verificando archivos base del arnés ──────────────"
 
-for f in AGENTS.md feature_list.json progress/current.md docs/architecture.md docs/conventions.md docs/verification.md docs/security-scope.md CHECKPOINTS.md; do
+for f in feature_list.json CHECKPOINTS.md; do
   if [ ! -f "$f" ]; then
     fail "Falta archivo base: $f"
     EXIT_CODE=1
@@ -101,7 +101,7 @@ else
   if cargo test -- --ignored 2>&1; then
     ok "Tests de integración con Docker (testcontainers, #[ignore]) pasan o no hay ninguno todavía"
   else
-    fail "Hay tests de integración (testcontainers) rotos, o Docker no está disponible. Si es por Docker, documenta el bloqueo en progress/current.md (ver docs/verification.md) — no los reemplaces por mocks."
+    fail "Hay tests de integración (testcontainers) rotos, o Docker no está disponible. Si es por Docker, documenta el bloqueo en el documento de la feature (odd/tasks/<feature>.md) — no los reemplaces por mocks."
     EXIT_CODE=1
   fi
 

@@ -1,70 +1,60 @@
-# AGENTS.md — Mapa de navegación para agentes de IA
+# Reglas de revisión de código — user-service
 
-> Este archivo es el **punto de entrada** para cualquier agente que trabaje en este
-> repositorio. NO es una biblia de reglas: es un **mapa**. Lee solo lo que
-> necesites cuando lo necesites (divulgación progresiva).
+> Reglas que usa el revisor automático (Gentleman Guardian Angel) sobre cada
+> commit. Un diff que viole una regla marcada como **bloqueante** se rechaza.
 
----
+## Contexto
 
-## 1. Antes de empezar (obligatorio)
+`user-service` (`ms-usuarios`) es un microservicio Rust (tokio + axum + sqlx
+sobre PostgreSQL). Recibe del Gateway una identidad ya verificada y guarda
+perfiles, histórico de escaneos, auditoría y credenciales de red cifradas.
 
-1. Ejecuta `./init.sh` y verifica que termina sin errores. Si falla, **para**
-   y resuelve el entorno antes de tocar código.
-2. Lee `progress/current.md` para entender en qué estado quedó la última sesión.
-3. Lee `feature_list.json` y elige **una** tarea con estado `pending`. No
-   trabajes en más de una a la vez.
+## Seguridad (bloqueante)
 
-## 2. Mapa del repositorio
+- Nunca escribir datos personales (`sub`, `email`, nombre de Google) ni
+  secretos (credencial de servicio, claves de cifrado, credenciales de red)
+  en logs de `tracing`, mensajes de error, respuestas HTTP o panic messages.
+- Los errores internos nunca exponen detalle de infraestructura en el cuerpo
+  de la respuesta HTTP: van como `ApiError::Internal` genérico y el detalle
+  solo al log del servidor.
+- Todo handler que reciba un identificador de recurso verifica que pertenece
+  a la identidad reenviada por el Gateway antes de tocar la base de datos
+  (`403` si no coincide). Nunca se confía en un `user_id` del cuerpo o query.
+- Ningún secreto ni valor de configuración hardcodeado: todo sale de
+  variables de entorno vía `src/config.rs`, con tipos que redactan su
+  contenido (`secrecy`).
+- `audit_log` es append-only: ningún `UPDATE`/`DELETE` sobre esa tabla, ni
+  métodos que lo permitan en el repositorio.
+- No agregar listeners públicos ni CORS abierto: el servicio solo habla con
+  el Gateway.
 
-| Archivo / carpeta            | Qué contiene                                              | Cuándo leerlo |
-|------------------------------|-----------------------------------------------------------|---------------|
-| `feature_list.json`          | Lista de tareas con estado (pending / in_progress / done) | Siempre, al empezar |
-| `progress/current.md`        | Estado de la sesión actual                                | Siempre, al empezar |
-| `progress/history.md`        | Bitácora append-only de sesiones anteriores                | Si necesitas contexto histórico |
-| `docs/architecture.md`       | Qué significa "hacer un buen trabajo" en este proyecto    | Antes de implementar |
-| `docs/conventions.md`        | Reglas de estilo, nombres, estructura                     | Antes de escribir código |
-| `docs/verification.md`       | Cómo verificar que tu trabajo funciona                    | Antes de declarar una tarea como `done` |
-| `docs/security-scope.md`     | Límites de autorización/alcance (identidad, PII, auditoría) | Antes de tocar perfiles de usuario, el log de auditoría o la comunicación con el Gateway |
-| `CHECKPOINTS.md`             | Criterios objetivos de "estado final correcto"            | Para auto-evaluarte |
-| `.claude/agents/`            | Definiciones de subagentes (líder, implementador, revisor) | Si orquestas trabajo |
-| `src/`                       | Código de la aplicación (crate Rust)                      | Para implementar |
-| `tests/`                     | Tests automáticos                                         | Para verificar |
+## Corrección (bloqueante)
 
-## 3. Reglas duras (no negociables)
+- Nada de `unwrap()`/`expect()`/`panic!()` fuera de tests, salvo condición
+  irrecuperable documentada con un comentario.
+- Errores tipados por módulo con `thiserror`; nada de `String` como error ni
+  `anyhow` en firmas públicas.
+- Ninguna llamada bloqueante dentro de código async (usar `spawn_blocking`).
+- Las migraciones ya aplicadas no se editan: un cambio de esquema es una
+  migración nueva en `migrations/`.
 
-- **Una sola feature a la vez.** No mezcles cambios de varias tareas en la misma sesión.
-- **No declares una tarea `done` sin pruebas verdes.** Ejecuta `./init.sh` y
-  asegúrate de que el bloque de tests pasa al 100%.
-- **Documenta lo que haces** en `progress/current.md` mientras trabajas, no al final.
-- **Deja el repositorio limpio** antes de cerrar la sesión (ver §5).
-- **Si no sabes algo, busca en `docs/`** antes de inventarlo.
-- **Antes de tocar identidad de usuario, el log de auditoría, las
-  credenciales de red cifradas o la comunicación Gateway↔ms-usuarios**, lee
-  `docs/security-scope.md`. Si la feature roza esos límites y no está claro
-  cómo proceder, para y pregunta al usuario.
+## Tests
 
-## 4. Cómo elegir una tarea
+- Todo cambio de comportamiento trae su test en el mismo commit.
+- Los tests que cruzan IO (`repository`, `api`) corren contra PostgreSQL real
+  vía `testcontainers` y se marcan `#[ignore = "requiere Docker"]`; nunca
+  mocks de la base de datos.
+- Datos de prueba sintéticos (`test-user-<n>@example.test`), nunca
+  identidades reales.
+- Nombres de test descriptivos del comportamiento
+  (`find_user_returns_none_when_user_does_not_exist`).
 
-```
-1. Abre feature_list.json
-2. Filtra por status == "pending"
-3. Coge la de menor "id"
-4. Cambia su status a "in_progress" y guarda
-5. Anota en progress/current.md: feature, hora de inicio, plan breve
-```
+## Estilo
 
-## 5. Cierre de sesión (lifecycle)
-
-Antes de terminar:
-
-1. Ejecuta `./init.sh` — todo verde.
-2. Si la tarea está acabada: marca `status: "done"` en `feature_list.json`.
-3. Mueve el resumen de `progress/current.md` al final de `progress/history.md`.
-4. Vacía `progress/current.md` dejando solo la plantilla.
-5. No dejes archivos temporales, ni `print()` de debug, ni TODOs sin contexto.
-
-## 6. Si te bloqueas
-
-- Relee la sección relevante de `docs/`.
-- Si la herramienta no hace lo que esperas, **no inventes un workaround**:
-  documenta el bloqueo en `progress/current.md` y para la sesión.
+- Código formateado con `cargo fmt` y sin warnings de
+  `cargo clippy --all-targets -- -D warnings`.
+- Todo ítem público lleva rustdoc `///` (el crate usa
+  `#![deny(missing_docs)]`).
+- Sin `println!`/`dbg!` de debug ni TODOs sin contexto.
+- Nombres: `snake_case` para módulos, funciones y variables; `PascalCase`
+  para tipos; `UPPER_SNAKE` para constantes.
