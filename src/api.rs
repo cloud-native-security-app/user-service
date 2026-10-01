@@ -556,11 +556,14 @@ impl From<RepoError> for ApiError {
     /// Traduce cualquier fallo de `repository` a un error interno genérico:
     /// el mensaje de [`RepoError`] nunca llega al cuerpo de la respuesta, ya
     /// que el objetivo es no exponer detalle de infraestructura al llamante.
+    /// El [`RepoError`] sí se registra en el log del servidor para poder
+    /// diagnosticar el fallo real.
     ///
     /// Los handlers que necesitan distinguir un [`RepoError::NotFound`] lo
     /// hacen con un `match` explícito antes de delegar aquí (p. ej.
     /// [`patch_scan_status`] o [`delete_network_credential`]).
-    fn from(_: RepoError) -> Self {
+    fn from(error: RepoError) -> Self {
+        tracing::error!(error = ?error, "fallo del repositorio");
         ApiError::Internal
     }
 }
@@ -671,6 +674,71 @@ mod tests {
         let headers = header_map(FORWARDED_USER_HEADER, r#"{"email":"user@example.test"}"#);
 
         assert!(parse_caller_identity(&headers).is_none());
+    }
+
+    /// Writer en memoria para capturar lo que se loguea durante un test.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn repo_error_is_logged_server_side_before_mapping_to_internal() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+
+        let api_error = tracing::subscriber::with_default(subscriber, || {
+            ApiError::from(RepoError::Constraint("42P01".to_string()))
+        });
+
+        let output = logs.contents();
+        assert!(matches!(api_error, ApiError::Internal));
+        assert!(output.contains("ERROR"), "log capturado: {output}");
+        assert!(output.contains("42P01"), "log capturado: {output}");
+    }
+
+    #[tokio::test]
+    async fn repo_error_keeps_the_generic_internal_response_contract() {
+        for repo_error in [
+            RepoError::ConnectionFailed,
+            RepoError::Constraint("42P01".to_string()),
+            RepoError::NotFound,
+            RepoError::Backend,
+        ] {
+            let response = ApiError::from(repo_error).into_response();
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], br#"{"error":"error interno del servicio"}"#);
+        }
     }
 
     #[test]

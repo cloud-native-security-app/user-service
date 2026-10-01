@@ -4,7 +4,12 @@
   "rules": {
     "one_feature_at_a_time": true,
     "require_tests_to_close": true,
-    "valid_status": ["pending", "in_progress", "done", "blocked"]
+    "valid_status": [
+      "pending",
+      "in_progress",
+      "done",
+      "blocked"
+    ]
   },
   "features": [
     {
@@ -163,6 +168,19 @@
         "Tests unitarios (sin Docker): matching de CIDR (exacto, contenido, más específico gana, sin match -> None), validación de target inválido, cifrado/descifrado round-trip con nonces distintos por fila",
         "Tests de integración (#[ignore = \"requiere Docker\"], testcontainers Postgres real): crear credencial -> resolver por IP exacta -> 200 con los 3 campos correctos; crear para un CIDR -> resolver una IP dentro de él -> 200; sin credenciales configuradas -> 422; borrar -> ya no resuelve; borrar una entrada ajena -> 404; smoke end-to-end vía HTTP real (mismo patrón que la feature service_wiring), no llamando handlers como funciones sueltas",
         "./init.sh en verde (2-3 corridas); cargo clippy/fmt/doc limpios; sin regresión en el resto de features. Depende de que la feature identity_header_contract esté done primero (usa CallerIdentity.sub)"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 11,
+      "name": "log_repo_errors",
+      "title": "Fix: loguear el RepoError real antes de convertirlo a ApiError::Internal",
+      "description": "Bug de observabilidad confirmado en produccion (AWS): POST /users/me/network-credentials responde 500 (que gateway traduce a 502) sin dejar NINGUN rastro en los logs, ni siquiera con RUST_LOG=info. Causa raiz: impl From<RepoError> for ApiError (src/api.rs, linea ~563) descarta el RepoError sin loguearlo -por diseno, para no filtrar detalle de infraestructura al CLIENTE-, pero de paso lo esconde tambien de los logs del propio servidor, hacienda imposible diagnosticar el fallo real (tabla faltante, fallo de cifrado, conexion a Postgres, etc.).",
+      "acceptance": [
+        "impl From<RepoError> for ApiError agrega un tracing::error!(error = ?value, \"fallo del repositorio\") (o equivalente con Display/Debug del RepoError) antes de devolver ApiError::Internal -el mensaje de RepoError sigue sin llegar nunca al cuerpo de la respuesta HTTP, solo se agrega al log del servidor-",
+        "No cambia ningun comportamiento de la API: mismo status code, mismo cuerpo de respuesta que antes, solo se agrega el log server-side",
+        "Test que confirma que un RepoError simulado sigue mapeando a ApiError::Internal con el mismo status/cuerpo que antes (no debe cambiar el contrato externo)",
+        "cargo test e ./init.sh pasan en verde"
       ],
       "status": "done"
     }
