@@ -1,7 +1,7 @@
 # Decisiones y historial de features
 
-Registro breve de las decisiones de diseño del servicio, destilado del antiguo
-lista de features del arnés anterior. Cada entrada: contexto, decisión.
+Registro breve de las decisiones de diseño del servicio, destilado de la lista de
+features del arnés anterior. Cada entrada: contexto, decisión.
 
 ## ADR-001 Scaffolding: lib + binario delgado
 
