@@ -17,9 +17,26 @@ PostgreSQL vía `sqlx`, tests de integración con `testcontainers`.
 
 ## Desarrollo
 
-El repositorio se desarrolla guiado por agentes de IA sobre un arnés
-documental (`AGENTS.md`, `feature_list.json`, `docs/`, `CHECKPOINTS.md`),
-igual que `broker` y `nmap-service`. Antes de tocar código, lee `CLAUDE.md`.
+Verificación local completa (reemplaza al antiguo script de verificación):
+
+```
+make verify
+```
+
+Ejecuta `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test`, `cargo test -- --ignored` (tests de integración con
+`testcontainers`, requieren Docker) y `cargo doc --no-deps`. Cada paso también
+está disponible como target individual (`make fmt`, `make clippy`, `make test`,
+`make test-integration`, `make doc`).
+
+Las decisiones de diseño y el historial de features están en
+`docs/decisions.md`.
+
+## Desarrollo asistido por IA
+
+El repositorio usa gentle-ai: los planes de trabajo (ODD) viven en
+`odd/tasks/`, con copia de recuperación en Engram, y las reglas de revisión de
+código (Gentleman Guardian Angel) están en `AGENTS.md`.
 
 ## Despliegue (Docker)
 
