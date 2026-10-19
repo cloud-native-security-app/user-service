@@ -5,7 +5,7 @@
 //! `docs/conventions.md`) y se ejecutan con `cargo test -- --ignored`.
 //!
 //! Diseño de dos pools por contenedor (ver
-//! `progress/explore_audit_log_permissions.md`):
+//! `docs/decisions.md`, ADR-004):
 //! - `superuser_pool`: el rol por defecto de la imagen del módulo
 //!   (`postgres`/`postgres`/db `postgres`), usado para aplicar las
 //!   migraciones (`sqlx::migrate!`) y para activar el login del rol de

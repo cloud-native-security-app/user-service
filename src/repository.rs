@@ -421,7 +421,7 @@ impl Repository {
     /// objetivo `target` (IP exacta o CIDR, ya validado por el llamante) —
     /// feature `network_credentials_api`.
     ///
-    /// Reglas de matching (ver la feature en `feature_list.json`): un
+    /// Reglas de matching (ver `docs/decisions.md`, ADR-010): un
     /// `target_pattern` matchea si `target` es una IP contenida en él, o si
     /// son el mismo CIDR. Si varias entradas matchean, gana la de
     /// `target_pattern` más específico (prefijo más largo). El valor en

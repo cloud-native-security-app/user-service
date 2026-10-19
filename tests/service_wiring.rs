@@ -9,7 +9,7 @@
 //! producción.
 //!
 //! Mismo patrón de dos pools por contenedor que `tests/api.rs`/
-//! `tests/repository.rs` (ver `progress/explore_audit_log_permissions.md`):
+//! `tests/repository.rs` (ver `docs/decisions.md`, ADR-004):
 //! el pool de superusuario aplica las migraciones y activa el login del rol
 //! de aplicación; el rol `ms_usuarios_app` (con su login activado en
 //! runtime, contraseña efímera nunca hardcodeada) es el que sirve tráfico
