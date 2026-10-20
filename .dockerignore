@@ -1,0 +1,14 @@
+# Contexto de build mínimo: solo lo que necesita `cargo build --release --bin user_service`.
+# NO excluir Cargo.toml, Cargo.lock (build reproducible), src/ ni migrations/
+# (sqlx::migrate! las necesita en tiempo de compilación para embeberlas).
+
+target/
+.git/
+.gitignore
+.claude/
+progress/
+docs/
+tests/
+*.md
+Dockerfile
+.dockerignore

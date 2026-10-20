@@ -1,2 +1,6 @@
 /target
 *.tmp
+# Local Pi runtime state
+.atl/
+
+.gga
