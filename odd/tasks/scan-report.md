@@ -53,13 +53,14 @@ Request body (`application/json`):
 - `status` required. `result` and `failure_reason` optional; the old `{"status": "..."}` payload keeps working.
 - `result`: only with `COMPLETADO`; must be a JSON object; serialized size <= 262144 bytes (256 KiB). Stored verbatim (the gateway sends the `ScanResult` JSON as-is; user-service does not interpret it).
 - `failure_reason`: only with `FALLIDO` or `CANCELADO`; not blank; <= 500 characters (Unicode scalar values).
-- Replace semantics: each PATCH sets `result` and `failure_reason` to exactly what is sent (absent = cleared). The gateway must send the `result` in the same PATCH that sets `COMPLETADO`.
+- Terminal states are final: once the scan is `COMPLETADO`, `FALLIDO` or `CANCELADO`, any later PATCH (late `EN_PROGRESO`, retries, a different terminal status) is a no-op that keeps status, `result`, `failure_reason` and `updated_at`, and returns `204` (SQS is unordered and at-least-once). Enforced atomically in SQL (`UPDATE ... WHERE status NOT IN (terminals)`); `404`/`403` still apply for unknown/foreign scans.
+- Replace semantics (between non-terminal updates): each PATCH sets `result` and `failure_reason` to exactly what is sent (absent = cleared). The gateway must send the `result` in the same PATCH that sets `COMPLETADO`.
 
 Responses:
 
 | Code | When |
 |------|------|
-| `204` | Updated (no body) |
+| `204` | Updated, or no-op because the scan is already terminal (no body) |
 | `400` | `result` on non-`COMPLETADO`; `result` not an object; `failure_reason` on other statuses; blank or >500-char `failure_reason`; malformed/unknown `status` (axum JSON rejection, 4xx) |
 | `401` / `400` | Missing/invalid shared secret / missing identity header |
 | `403` | Scan exists but belongs to another user |
@@ -94,5 +95,7 @@ Responses:
 ## Deviations / notes
 
 - `COMPLETADO` without `result` is accepted (backwards compatibility); its report answers `409`.
+- `ApiError::NotFound` message is now the generic `el recurso solicitado no existe` (all 404 bodies).
+- Follow-up GGA fixes: terminal-final rule, `Cancelado` in the DB-encoding round-trip test, generic NotFound message, failure_reason message built from `MAX_FAILURE_REASON_CHARS`. RED: 3 new tests failed before the SQL guard/message change (status overwritten `FALLIDO` vs `COMPLETADO`, old message); GREEN after.
 - Report path chosen: `/users/me/scans/{scan_id}/report` (same collection prefix and identity model as the other per-user history routes).
 - `sqlx` gained the `json` feature (JSONB <-> `serde_json::Value`); `Cargo.lock` unchanged except as cargo required.

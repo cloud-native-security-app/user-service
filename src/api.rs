@@ -362,12 +362,12 @@ fn validate_scan_update(payload: &UpdateScanStatusRequest) -> Result<(), ApiErro
     if let Some(result) = &payload.result {
         if payload.status != ScanStatus::Completado {
             return Err(ApiError::InvalidScanUpdate(
-                "result solo se acepta con el estado COMPLETADO",
+                "result solo se acepta con el estado COMPLETADO".to_string(),
             ));
         }
         if !result.is_object() {
             return Err(ApiError::InvalidScanUpdate(
-                "result debe ser un objeto JSON",
+                "result debe ser un objeto JSON".to_string(),
             ));
         }
         let size = serde_json::to_vec(result)
@@ -381,18 +381,18 @@ fn validate_scan_update(payload: &UpdateScanStatusRequest) -> Result<(), ApiErro
     if let Some(reason) = &payload.failure_reason {
         if !matches!(payload.status, ScanStatus::Fallido | ScanStatus::Cancelado) {
             return Err(ApiError::InvalidScanUpdate(
-                "failure_reason solo se acepta con FALLIDO o CANCELADO",
+                "failure_reason solo se acepta con FALLIDO o CANCELADO".to_string(),
             ));
         }
         if reason.trim().is_empty() {
             return Err(ApiError::InvalidScanUpdate(
-                "failure_reason no puede estar vacío",
+                "failure_reason no puede estar vacío".to_string(),
             ));
         }
         if reason.chars().count() > MAX_FAILURE_REASON_CHARS {
-            return Err(ApiError::InvalidScanUpdate(
-                "failure_reason supera los 500 caracteres",
-            ));
+            return Err(ApiError::InvalidScanUpdate(format!(
+                "failure_reason supera los {MAX_FAILURE_REASON_CHARS} caracteres"
+            )));
         }
     }
 
@@ -644,16 +644,17 @@ enum ApiError {
     /// consultado en `GET /users/me/scan-targets`.
     #[error("no se encontraron credenciales de red para el objetivo")]
     UnprocessableEntity,
-    /// El perfil solicitado no existe.
-    #[error("el perfil solicitado no existe")]
+    /// El recurso solicitado (perfil, escaneo, credencial) no existe o no es
+    /// del llamante.
+    #[error("el recurso solicitado no existe")]
     NotFound,
     /// El recurso solicitado existe pero no pertenece al llamante.
     #[error("el recurso solicitado no pertenece al llamante")]
     Forbidden,
     /// Combinación inválida de campos en `PATCH /scans/{scan_id}`; el mensaje
-    /// es una constante que nunca incluye valores del llamante.
+    /// nunca incluye valores del llamante.
     #[error("{0}")]
-    InvalidScanUpdate(&'static str),
+    InvalidScanUpdate(String),
     /// `result` supera el tamaño máximo permitido.
     #[error("result supera el tamaño máximo de 256 KB")]
     PayloadTooLarge,

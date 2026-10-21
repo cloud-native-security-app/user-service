@@ -1542,3 +1542,127 @@ async fn report_requires_gateway_secret_and_identity() {
     assert_eq!(no_secret.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(no_identity.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn late_patch_after_a_terminal_status_is_a_204_noop_that_keeps_the_stored_data() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "terminal-owner").await;
+    patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+
+    let late = patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+    let repeat = patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+    let contradictory = patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "tarde"}),
+    )
+    .await;
+
+    assert_eq!(late.status(), StatusCode::NO_CONTENT);
+    assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
+    assert_eq!(contradictory.status(), StatusCode::NO_CONTENT);
+    let history = get_history(&router, "terminal-owner").await;
+    assert_eq!(history[0]["status"], "COMPLETADO");
+    assert!(history[0]["failure_reason"].is_null());
+    let report = get_report(&router, "terminal-owner", &scan_id).await;
+    assert_eq!(report.status(), StatusCode::OK);
+    assert_eq!(body_json(report).await, sample_result());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn late_patch_after_failed_keeps_status_and_failure_reason() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "terminal-failed").await;
+    patch_scan(
+        &router,
+        "terminal-failed",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "host inalcanzable"}),
+    )
+    .await;
+
+    let late = patch_scan(
+        &router,
+        "terminal-failed",
+        &scan_id,
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+
+    assert_eq!(late.status(), StatusCode::NO_CONTENT);
+    let history = get_history(&router, "terminal-failed").await;
+    assert_eq!(history[0]["status"], "FALLIDO");
+    assert_eq!(history[0]["failure_reason"], "host inalcanzable");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_on_a_terminal_scan_still_returns_404_and_403_for_unknown_or_foreign() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "terminal-real").await;
+    create_profile(&router, "terminal-other").await;
+    patch_scan(
+        &router,
+        "terminal-real",
+        &scan_id,
+        json!({"status": "CANCELADO"}),
+    )
+    .await;
+
+    let foreign = patch_scan(
+        &router,
+        "terminal-other",
+        &scan_id,
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+    let unknown = patch_scan(
+        &router,
+        "terminal-real",
+        "no-existe",
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn not_found_error_body_is_generic() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let response = get_report(&router, "someone", "no-existe").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await,
+        json!({"error": "el recurso solicitado no existe"})
+    );
+}

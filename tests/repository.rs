@@ -437,6 +437,78 @@ async fn find_scan_result_returns_status_without_result_while_not_completed() {
 
 #[tokio::test]
 #[ignore = "requiere Docker"]
+async fn terminal_status_is_final_and_later_updates_keep_status_result_and_reason() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-t1", "scan-t1c").await;
+    repo.insert_scan_history(&sample_scan(
+        "scan-t1f",
+        "test-user-t1",
+        ScanStatus::Pendiente,
+    ))
+    .await
+    .unwrap();
+    let result = serde_json::json!({"ports": []});
+    repo.update_scan_outcome("scan-t1c", ScanStatus::Completado, Some(&result), None)
+        .await
+        .unwrap();
+    repo.update_scan_outcome("scan-t1f", ScanStatus::Fallido, None, Some("motivo"))
+        .await
+        .unwrap();
+
+    for late in [
+        ScanStatus::EnProgreso,
+        ScanStatus::Pendiente,
+        ScanStatus::Cancelado,
+    ] {
+        repo.update_scan_outcome("scan-t1c", late, None, None)
+            .await
+            .expect("una actualización tardía es un no-op, no un error");
+        repo.update_scan_status("scan-t1f", late)
+            .await
+            .expect("una actualización tardía es un no-op, no un error");
+    }
+
+    let completed = repo
+        .find_scan_result("test-user-t1", "scan-t1c")
+        .await
+        .unwrap();
+    assert_eq!(
+        completed,
+        Some(StoredScanResult {
+            status: ScanStatus::Completado,
+            result: Some(result)
+        })
+    );
+    let history = repo.list_scan_history("test-user-t1").await.unwrap();
+    let failed = history.iter().find(|e| e.scan_id == "scan-t1f").unwrap();
+    assert_eq!(failed.status, ScanStatus::Fallido);
+    assert_eq!(failed.failure_reason.as_deref(), Some("motivo"));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn repeating_the_same_terminal_update_is_idempotent() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-t2", "scan-t2").await;
+    let result = serde_json::json!({"ports": []});
+
+    for _ in 0..2 {
+        repo.update_scan_outcome("scan-t2", ScanStatus::Completado, Some(&result), None)
+            .await
+            .expect("repetir el mismo desenlace terminal no es un error");
+    }
+
+    let stored = repo
+        .find_scan_result("test-user-t2", "scan-t2")
+        .await
+        .unwrap();
+    assert_eq!(stored.unwrap().result, Some(result));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
 async fn append_audit_entry_persists_it_and_it_is_readable() {
     let db = start_test_db().await;
     let repo = Repository::new(db.app_pool.clone(), test_encryption_key());

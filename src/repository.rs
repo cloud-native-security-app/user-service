@@ -135,6 +135,11 @@ impl Repository {
     /// Actualiza el estado de una entrada de histórico existente,
     /// refrescando `updated_at` al momento de la actualización.
     ///
+    /// Los estados terminales (`COMPLETADO`, `FALLIDO`, `CANCELADO`) son
+    /// finales: si el escaneo ya está en uno, la llamada es un no-op
+    /// idempotente (`Ok(())`) que conserva estado, resultado y motivo. Ver
+    /// [`Repository::update_scan_outcome`].
+    ///
     /// # Errores
     ///
     /// Devuelve [`RepoError::NotFound`] si `scan_id` no existe, o
@@ -155,6 +160,13 @@ impl Repository {
     /// exactamente como se pasan (`None` los limpia). La validación de qué
     /// combinación estado/campos es legal vive en `api`.
     ///
+    /// Los estados terminales son finales (SQS estándar no garantiza orden ni
+    /// entrega única): el `UPDATE` lleva `WHERE status NOT IN (terminales)`,
+    /// de modo que es atómico frente a actualizaciones concurrentes. Si el
+    /// escaneo ya es terminal no cambia nada (ni estado, ni resultado, ni
+    /// motivo, ni `updated_at`) y devuelve `Ok(())`, también cuando se repite
+    /// el mismo desenlace.
+    ///
     /// # Errores
     ///
     /// Devuelve [`RepoError::NotFound`] si `scan_id` no existe, o
@@ -169,7 +181,8 @@ impl Repository {
         let outcome = sqlx::query(
             "UPDATE scan_history \
              SET status = $1, result = $2, failure_reason = $3, updated_at = now() \
-             WHERE scan_id = $4",
+             WHERE scan_id = $4 \
+             AND status NOT IN ('COMPLETADO', 'FALLIDO', 'CANCELADO')",
         )
         .bind(status_as_db_str(status))
         .bind(result)
@@ -179,7 +192,11 @@ impl Repository {
         .await?;
 
         if outcome.rows_affected() == 0 {
-            return Err(RepoError::NotFound);
+            // 0 filas: o no existe (NotFound) o ya es terminal (no-op).
+            return match self.find_scan_owner(scan_id).await? {
+                Some(_) => Ok(()),
+                None => Err(RepoError::NotFound),
+            };
         }
 
         Ok(())
@@ -835,6 +852,7 @@ mod tests {
             ScanStatus::EnProgreso,
             ScanStatus::Completado,
             ScanStatus::Fallido,
+            ScanStatus::Cancelado,
         ] {
             let encoded = status_as_db_str(status);
             let decoded = status_from_db_str(encoded).expect("debe decodificar su propio encoding");
