@@ -20,6 +20,10 @@ Migraciones versionadas de `sqlx migrate` para `db-usuarios` (feature
   grants `SELECT/INSERT/UPDATE/DELETE` para `ms_usuarios_app` — esta tabla
   SÍ es mutable por diseño (CRUD de credenciales propias), a diferencia de
   `audit_log`.
+- `20261020120000_add_scan_result_and_cancelled.sql`: feature `scan-report`;
+  `scan_history` gana `result JSONB NULL` y `failure_reason TEXT NULL`, y la
+  restricción `CHECK` de `status` admite `CANCELADO`. Aditiva y
+  retrocompatible.
 
 Recordatorio de convención (ver `docs/conventions.md`): una vez aplicada una
 migración en algún entorno, nunca se edita — un cambio de esquema es una
