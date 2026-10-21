@@ -26,7 +26,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
-use user_service::domain::{AuditEntry, ScanHistoryEntry, ScanStatus, UserProfile};
+use user_service::domain::{
+    AuditEntry, ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
+};
 use user_service::repository::{parse_target, RepoError, Repository};
 use uuid::Uuid;
 
@@ -134,6 +136,7 @@ fn sample_scan(scan_id: &str, user_id: &str, status: ScanStatus) -> ScanHistoryE
         status,
         requested_at: now,
         updated_at: now,
+        failure_reason: None,
     }
 }
 
@@ -281,6 +284,155 @@ async fn update_scan_status_returns_not_found_for_unknown_scan_id() {
         .await;
 
     assert!(matches!(result, Err(RepoError::NotFound)));
+}
+
+/// Inserta un usuario y un escaneo `Pendiente` para los tests de resultado.
+async fn seed_scan(repo: &Repository, user_id: &str, scan_id: &str) {
+    repo.upsert_user(&sample_profile(user_id))
+        .await
+        .expect("el usuario debe crearse");
+    repo.insert_scan_history(&sample_scan(scan_id, user_id, ScanStatus::Pendiente))
+        .await
+        .expect("insert_scan_history no debe fallar");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn update_scan_outcome_persists_the_result_and_find_scan_result_returns_it() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-r1", "scan-r1").await;
+    let result =
+        serde_json::json!({"ports": [{"port": 22, "state": "open"}], "vulnerabilities": []});
+
+    repo.update_scan_outcome("scan-r1", ScanStatus::Completado, Some(&result), None)
+        .await
+        .expect("guardar el resultado debe funcionar");
+
+    let stored = repo
+        .find_scan_result("test-user-r1", "scan-r1")
+        .await
+        .expect("find_scan_result no debe fallar");
+    assert_eq!(
+        stored,
+        Some(StoredScanResult {
+            status: ScanStatus::Completado,
+            result: Some(result),
+        })
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn update_scan_outcome_persists_failure_reason_for_failed_and_cancelled() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-r2", "scan-r2a").await;
+    repo.insert_scan_history(&sample_scan(
+        "scan-r2b",
+        "test-user-r2",
+        ScanStatus::Pendiente,
+    ))
+    .await
+    .expect("segundo escaneo");
+
+    repo.update_scan_outcome(
+        "scan-r2a",
+        ScanStatus::Fallido,
+        None,
+        Some("timeout de nmap"),
+    )
+    .await
+    .expect("FALLIDO con motivo");
+    repo.update_scan_outcome("scan-r2b", ScanStatus::Cancelado, None, Some("cancelado"))
+        .await
+        .expect("CANCELADO con motivo");
+
+    let history = repo
+        .list_scan_history("test-user-r2")
+        .await
+        .expect("list_scan_history no debe fallar");
+    assert_eq!(history[0].status, ScanStatus::Fallido);
+    assert_eq!(
+        history[0].failure_reason.as_deref(),
+        Some("timeout de nmap")
+    );
+    assert_eq!(history[1].status, ScanStatus::Cancelado);
+    assert_eq!(history[1].failure_reason.as_deref(), Some("cancelado"));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn cancelled_status_round_trips_through_update_scan_status() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-r3", "scan-r3").await;
+
+    repo.update_scan_status("scan-r3", ScanStatus::Cancelado)
+        .await
+        .expect("la restricción CHECK debe aceptar CANCELADO");
+
+    let history = repo.list_scan_history("test-user-r3").await.unwrap();
+    assert_eq!(history[0].status, ScanStatus::Cancelado);
+    assert_eq!(history[0].failure_reason, None);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn update_scan_outcome_returns_not_found_for_unknown_scan_id() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+
+    let result = repo
+        .update_scan_outcome("no-existe", ScanStatus::Fallido, None, Some("x"))
+        .await;
+
+    assert!(matches!(result, Err(RepoError::NotFound)));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn find_scan_result_returns_none_for_unknown_or_foreign_scan() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-r4", "scan-r4").await;
+    repo.upsert_user(&sample_profile("test-user-r4-other"))
+        .await
+        .expect("otro usuario");
+
+    assert_eq!(
+        repo.find_scan_result("test-user-r4", "no-existe")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        repo.find_scan_result("test-user-r4-other", "scan-r4")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn find_scan_result_returns_status_without_result_while_not_completed() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-r5", "scan-r5").await;
+
+    let stored = repo
+        .find_scan_result("test-user-r5", "scan-r5")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stored,
+        Some(StoredScanResult {
+            status: ScanStatus::Pendiente,
+            result: None,
+        })
+    );
 }
 
 #[tokio::test]

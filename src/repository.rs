@@ -36,7 +36,8 @@ use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::PgPool;
 
 use crate::domain::{
-    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus, UserProfile,
+    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus,
+    StoredScanResult, UserProfile,
 };
 
 /// Longitud del nonce de AES-256-GCM (96 bits, el tamaño que exige la
@@ -144,19 +145,74 @@ impl Repository {
         scan_id: &str,
         status: ScanStatus,
     ) -> Result<(), RepoError> {
-        let result = sqlx::query(
-            "UPDATE scan_history SET status = $1, updated_at = now() WHERE scan_id = $2",
+        self.update_scan_outcome(scan_id, status, None, None).await
+    }
+
+    /// Actualiza el estado de una entrada de histórico junto con su
+    /// resultado y su motivo de fallo/cancelación (feature `scan-report`).
+    ///
+    /// Semántica de reemplazo: `result` y `failure_reason` quedan
+    /// exactamente como se pasan (`None` los limpia). La validación de qué
+    /// combinación estado/campos es legal vive en `api`.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError::NotFound`] si `scan_id` no existe, o
+    /// [`RepoError`] si la consulta falla por otro motivo.
+    pub async fn update_scan_outcome(
+        &self,
+        scan_id: &str,
+        status: ScanStatus,
+        result: Option<&serde_json::Value>,
+        failure_reason: Option<&str>,
+    ) -> Result<(), RepoError> {
+        let outcome = sqlx::query(
+            "UPDATE scan_history \
+             SET status = $1, result = $2, failure_reason = $3, updated_at = now() \
+             WHERE scan_id = $4",
         )
         .bind(status_as_db_str(status))
+        .bind(result)
+        .bind(failure_reason)
         .bind(scan_id)
         .execute(&self.pool)
         .await?;
 
-        if result.rows_affected() == 0 {
+        if outcome.rows_affected() == 0 {
             return Err(RepoError::NotFound);
         }
 
         Ok(())
+    }
+
+    /// Lee el estado y el resultado guardado de `scan_id`, solo si pertenece
+    /// a `user_id`. Un `scan_id` inexistente **o de otro usuario** devuelve
+    /// `Ok(None)` (el llamante responde `404` en ambos casos, sin revelar de
+    /// quién es).
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
+    pub async fn find_scan_result(
+        &self,
+        user_id: &str,
+        scan_id: &str,
+    ) -> Result<Option<StoredScanResult>, RepoError> {
+        let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT status, result FROM scan_history WHERE scan_id = $1 AND user_id = $2",
+        )
+        .bind(scan_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|(status, result)| {
+            Ok(StoredScanResult {
+                status: status_from_db_str(&status)?,
+                result,
+            })
+        })
+        .transpose()
     }
 
     /// Devuelve el `user_id` dueño de `scan_id`, para que el llamante
@@ -195,7 +251,7 @@ impl Repository {
         user_id: &str,
     ) -> Result<Vec<ScanHistoryEntry>, RepoError> {
         let rows = sqlx::query_as::<_, ScanHistoryRow>(
-            "SELECT scan_id, user_id, target, status, requested_at, updated_at \
+            "SELECT scan_id, user_id, target, status, requested_at, updated_at, failure_reason \
              FROM scan_history WHERE user_id = $1 ORDER BY requested_at ASC",
         )
         .bind(user_id)
@@ -496,7 +552,7 @@ impl From<UserRow> for UserProfile {
 }
 
 /// Fila cruda de la tabla `scan_history`, mapeada a [`ScanHistoryEntry`] vía
-/// `TryFrom` (el estado se valida contra las 4 variantes conocidas de
+/// `TryFrom` (el estado se valida contra las variantes conocidas de
 /// [`ScanStatus`]).
 #[derive(sqlx::FromRow)]
 struct ScanHistoryRow {
@@ -506,6 +562,7 @@ struct ScanHistoryRow {
     status: String,
     requested_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    failure_reason: Option<String>,
 }
 
 impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
@@ -519,6 +576,7 @@ impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
             status: status_from_db_str(&row.status)?,
             requested_at: row.requested_at,
             updated_at: row.updated_at,
+            failure_reason: row.failure_reason,
         })
     }
 }
@@ -550,6 +608,7 @@ fn status_as_db_str(status: ScanStatus) -> &'static str {
         ScanStatus::EnProgreso => "EN_PROGRESO",
         ScanStatus::Completado => "COMPLETADO",
         ScanStatus::Fallido => "FALLIDO",
+        ScanStatus::Cancelado => "CANCELADO",
     }
 }
 
@@ -559,7 +618,7 @@ fn status_as_db_str(status: ScanStatus) -> &'static str {
 /// # Errores
 ///
 /// Devuelve [`RepoError::Backend`] si el valor no coincide con ninguna de
-/// las 4 variantes conocidas — no debería ocurrir nunca en la práctica
+/// las variantes conocidas — no debería ocurrir nunca en la práctica
 /// porque la restricción `CHECK` de la migración ya lo impide, pero se
 /// maneja como error tipado en vez de un `panic!`/`unwrap()` por si el
 /// esquema y este código llegaran a divergir.
@@ -569,6 +628,7 @@ fn status_from_db_str(value: &str) -> Result<ScanStatus, RepoError> {
         "EN_PROGRESO" => Ok(ScanStatus::EnProgreso),
         "COMPLETADO" => Ok(ScanStatus::Completado),
         "FALLIDO" => Ok(ScanStatus::Fallido),
+        "CANCELADO" => Ok(ScanStatus::Cancelado),
         _ => Err(RepoError::Backend),
     }
 }
