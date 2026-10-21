@@ -163,8 +163,9 @@ middleware interno antes de tocar la base de datos (ver
 | `PUT /users/me` | Crea o actualiza el perfil del llamante. Cuerpo: `{"display_name": "..."}` |
 | `GET /users/me` | Perfil del llamante; `404` si aún no tiene perfil |
 | `POST /users/me/scans` | Registra una solicitud de escaneo (estado `Pendiente`) + su auditoría, en la misma transacción. Cuerpo: `{"target": "..."}` |
-| `GET /users/me/scans` | Histórico de escaneos del llamante |
-| `PATCH /scans/{scan_id}` | Actualiza el estado de una solicitud propia; `404` si no existe, `403` si es de otro usuario |
+| `GET /users/me/scans` | Histórico de escaneos del llamante. Cada entrada incluye `failure_reason` (`null` si no hay) y nunca el resultado completo. Estados: `PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO` |
+| `GET /users/me/scans/{scan_id}/report` | Resultado guardado de un escaneo propio (el JSON `ScanResult` tal cual). `404` si no existe o es de otro usuario, `409` si aún no está `COMPLETADO` con resultado |
+| `PATCH /scans/{scan_id}` | Actualiza el estado de una solicitud propia; `404` si no existe, `403` si es de otro usuario. Cuerpo: `{"status": "...", "result"?: {...}, "failure_reason"?: "..."}`; `result` solo con `COMPLETADO` (objeto JSON, máx. 256 KB, `413` si lo supera), `failure_reason` solo con `FALLIDO`/`CANCELADO` (no vacío, máx. 500 caracteres); combinación inválida: `400`. Respuesta `204`. Los estados terminales (`COMPLETADO`, `FALLIDO`, `CANCELADO`) son finales: un PATCH posterior (p. ej. un `EN_PROGRESO` tardío o un reintento) es un no-op idempotente que conserva estado, `result` y `failure_reason` y responde `204`. Detalle en `odd/tasks/scan-report.md` |
 | `GET /users/me/audit` | Auditoría del llamante (RF-15) |
 | `POST /users/me/network-credentials` | Crea/actualiza (upsert por `user_id`+`target_pattern`) las credenciales de red del llamante para un objetivo. Cuerpo: `{"target_pattern": "203.0.113.7" \| "203.0.113.0/24" (IP o CIDR v4/v6), "network_user": "...", "ssh_credentials_ref": "...", "has_sudo": bool}`. `ssh_credentials_ref` se cifra en reposo y **nunca** aparece en la respuesta |
 | `GET /users/me/network-credentials` | Credenciales de red del llamante, sin la credencial SSH |

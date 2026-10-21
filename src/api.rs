@@ -13,7 +13,14 @@
 //!   escaneo existente (llamado por el Gateway al recibir un desenlace);
 //!   `404` si `scan_id` no existe, `403` si existe pero no pertenece al
 //!   llamante (autorización a nivel de fila, ver `docs/security-scope.md`).
-//! - `GET /users/me/scans` (RF-13): histórico de escaneos del llamante.
+//!   Acepta además `result` (solo con `COMPLETADO`) y `failure_reason` (solo
+//!   con `FALLIDO` o `CANCELADO`), ambos opcionales (ver
+//!   [`validate_scan_update`]).
+//! - `GET /users/me/scans` (RF-13): histórico de escaneos del llamante, con
+//!   `failure_reason` pero sin el resultado completo.
+//! - `GET /users/me/scans/{scan_id}/report`: resultado guardado de un
+//!   escaneo propio; `404` si no existe o no es del llamante, `409` si aún
+//!   no tiene resultado.
 //! - `GET /users/me/audit` (RF-15): entradas de auditoría del llamante.
 //! - `POST /users/me/network-credentials` (feature `network_credentials_api`,
 //!   id 10): crea o actualiza (upsert por `user_id` + `target_pattern`) las
@@ -79,6 +86,13 @@ use crate::domain::{
 };
 use crate::repository::{parse_target, RepoError, Repository};
 
+/// Largo máximo (en caracteres) de `failure_reason`.
+const MAX_FAILURE_REASON_CHARS: usize = 500;
+
+/// Tamaño máximo (en bytes del JSON serializado) de `result`: el límite de
+/// un mensaje SNS/SQS.
+const MAX_RESULT_BYTES: usize = 256 * 1024;
+
 /// Acción de auditoría registrada por [`create_scan`] junto con cada nueva
 /// entrada de histórico (RF-15).
 const SCAN_REQUESTED_ACTION: &str = "scan_requested";
@@ -119,6 +133,7 @@ pub fn router(repository: Repository, gateway_shared_secret: SecretString) -> Ro
     Router::new()
         .route("/users/me", get(get_profile).put(put_profile))
         .route("/users/me/scans", get(list_scans).post(create_scan))
+        .route("/users/me/scans/:scan_id/report", get(get_scan_report))
         .route("/users/me/audit", get(list_audit))
         .route("/scans/:scan_id", axum::routing::patch(patch_scan_status))
         .route(
@@ -306,6 +321,7 @@ async fn create_scan(
         status: ScanStatus::Pendiente,
         requested_at: now,
         updated_at: now,
+        failure_reason: None,
     };
     let audit_entry = AuditEntry::new(
         Uuid::new_v4().to_string(),
@@ -328,6 +344,59 @@ async fn create_scan(
 #[derive(Debug, Deserialize)]
 struct UpdateScanStatusRequest {
     status: ScanStatus,
+    /// Resultado del escaneo (objeto JSON); solo con `COMPLETADO`.
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    /// Motivo del fallo o la cancelación; solo con `FALLIDO`/`CANCELADO`.
+    #[serde(default)]
+    failure_reason: Option<String>,
+}
+
+/// Valida la combinación estado/`result`/`failure_reason` de un `PATCH`.
+///
+/// - `result`: solo con `COMPLETADO`, debe ser un objeto JSON y su
+///   serialización no puede superar [`MAX_RESULT_BYTES`] (`413`).
+/// - `failure_reason`: solo con `FALLIDO`/`CANCELADO`, no puede ser vacío ni
+///   solo espacios y no puede superar [`MAX_FAILURE_REASON_CHARS`].
+fn validate_scan_update(payload: &UpdateScanStatusRequest) -> Result<(), ApiError> {
+    if let Some(result) = &payload.result {
+        if payload.status != ScanStatus::Completado {
+            return Err(ApiError::InvalidScanUpdate(
+                "result solo se acepta con el estado COMPLETADO".to_string(),
+            ));
+        }
+        if !result.is_object() {
+            return Err(ApiError::InvalidScanUpdate(
+                "result debe ser un objeto JSON".to_string(),
+            ));
+        }
+        let size = serde_json::to_vec(result)
+            .map_err(|_| ApiError::Internal)?
+            .len();
+        if size > MAX_RESULT_BYTES {
+            return Err(ApiError::PayloadTooLarge);
+        }
+    }
+
+    if let Some(reason) = &payload.failure_reason {
+        if !matches!(payload.status, ScanStatus::Fallido | ScanStatus::Cancelado) {
+            return Err(ApiError::InvalidScanUpdate(
+                "failure_reason solo se acepta con FALLIDO o CANCELADO".to_string(),
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(ApiError::InvalidScanUpdate(
+                "failure_reason no puede estar vacío".to_string(),
+            ));
+        }
+        if reason.chars().count() > MAX_FAILURE_REASON_CHARS {
+            return Err(ApiError::InvalidScanUpdate(format!(
+                "failure_reason supera los {MAX_FAILURE_REASON_CHARS} caracteres"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// `PATCH /scans/{scan_id}` — actualiza el estado de una solicitud de
@@ -340,12 +409,18 @@ struct UpdateScanStatusRequest {
 /// inexistente responde `404 Not Found`; uno que existe pero pertenece a
 /// otro usuario responde `403 Forbidden` (un `id` que no coincide nunca es
 /// un `404` silencioso).
+///
+/// Acepta además `result` y `failure_reason` opcionales, validados con
+/// [`validate_scan_update`] antes de tocar la base de datos. Los cambios de
+/// estado no se auditan (solo la solicitud, `scan_requested`).
 async fn patch_scan_status(
     State(state): State<AppState>,
     Extension(identity): Extension<CallerIdentity>,
     Path(scan_id): Path<String>,
     Json(payload): Json<UpdateScanStatusRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_scan_update(&payload)?;
+
     let owner = state
         .repository
         .find_scan_owner(&scan_id)
@@ -359,7 +434,12 @@ async fn patch_scan_status(
 
     match state
         .repository
-        .update_scan_status(&scan_id, payload.status)
+        .update_scan_outcome(
+            &scan_id,
+            payload.status,
+            payload.result.as_ref(),
+            payload.failure_reason.as_deref(),
+        )
         .await
     {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
@@ -381,6 +461,29 @@ async fn list_scans(
         .map_err(ApiError::from)?;
 
     Ok(Json(history))
+}
+
+/// `GET /users/me/scans/{scan_id}/report` — devuelve el resultado guardado
+/// de un escaneo del llamante, tal cual se almacenó.
+///
+/// `404` si el `scan_id` no existe **o es de otro usuario** (no revela de
+/// quién es), `409` si existe pero no está `COMPLETADO` con resultado.
+async fn get_scan_report(
+    State(state): State<AppState>,
+    Extension(identity): Extension<CallerIdentity>,
+    Path(scan_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let stored = state
+        .repository
+        .find_scan_result(&identity.sub, &scan_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::NotFound)?;
+
+    match (stored.status, stored.result) {
+        (ScanStatus::Completado, Some(result)) => Ok(Json(result)),
+        _ => Err(ApiError::ReportNotReady),
+    }
 }
 
 /// `GET /users/me/audit` — devuelve las entradas de auditoría del llamante
@@ -541,12 +644,23 @@ enum ApiError {
     /// consultado en `GET /users/me/scan-targets`.
     #[error("no se encontraron credenciales de red para el objetivo")]
     UnprocessableEntity,
-    /// El perfil solicitado no existe.
-    #[error("el perfil solicitado no existe")]
+    /// El recurso solicitado (perfil, escaneo, credencial) no existe o no es
+    /// del llamante.
+    #[error("el recurso solicitado no existe")]
     NotFound,
     /// El recurso solicitado existe pero no pertenece al llamante.
     #[error("el recurso solicitado no pertenece al llamante")]
     Forbidden,
+    /// Combinación inválida de campos en `PATCH /scans/{scan_id}`; el mensaje
+    /// nunca incluye valores del llamante.
+    #[error("{0}")]
+    InvalidScanUpdate(String),
+    /// `result` supera el tamaño máximo permitido.
+    #[error("result supera el tamaño máximo de 256 KB")]
+    PayloadTooLarge,
+    /// El escaneo existe pero todavía no tiene resultado (no `COMPLETADO`).
+    #[error("el reporte del escaneo aún no está disponible")]
+    ReportNotReady,
     /// Fallo interno (p. ej. de `repository`) no atribuible al llamante.
     #[error("error interno del servicio")]
     Internal,
@@ -573,7 +687,9 @@ impl IntoResponse for ApiError {
         let status = match self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::MissingIdentity => StatusCode::BAD_REQUEST,
-            ApiError::BadRequest => StatusCode::BAD_REQUEST,
+            ApiError::BadRequest | ApiError::InvalidScanUpdate(_) => StatusCode::BAD_REQUEST,
+            ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::ReportNotReady => StatusCode::CONFLICT,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Forbidden => StatusCode::FORBIDDEN,

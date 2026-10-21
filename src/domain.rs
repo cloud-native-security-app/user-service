@@ -33,16 +33,16 @@ pub struct UserProfile {
     pub created_at: DateTime<Utc>,
 }
 
-/// Estado de una solicitud de escaneo, según los 4 estados definidos por
-/// RF-07.
+/// Estado de una solicitud de escaneo: los 4 estados de RF-07 más
+/// `Cancelado` (feature `scan-report`).
 ///
 /// Es un enum cerrado: no existe una variante "desconocida" ni un valor por
-/// defecto silencioso — un valor fuera de estas 4 variantes no compila, y un
+/// defecto silencioso — un valor fuera de estas variantes no compila, y un
 /// string que no coincida con ninguna de ellas falla la deserialización en
 /// vez de mapear a un estado arbitrario. El encoding JSON usa
 /// `SCREAMING_SNAKE_CASE` para coincidir exactamente con los nombres de
 /// estado documentados en `docs/architecture.md`
-/// (`PENDIENTE`/`EN_PROGRESO`/`COMPLETADO`/`FALLIDO`).
+/// (`PENDIENTE`/`EN_PROGRESO`/`COMPLETADO`/`FALLIDO`/`CANCELADO`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ScanStatus {
@@ -54,6 +54,8 @@ pub enum ScanStatus {
     Completado,
     /// El escaneo terminó con un error y no produjo un resultado utilizable.
     Fallido,
+    /// El escaneo fue cancelado antes de terminar.
+    Cancelado,
 }
 
 /// Entrada del histórico de escaneos solicitados por un usuario (RF-13).
@@ -71,6 +73,21 @@ pub struct ScanHistoryEntry {
     pub requested_at: DateTime<Utc>,
     /// Marca de tiempo de la última actualización de estado.
     pub updated_at: DateTime<Utc>,
+    /// Motivo del fallo o de la cancelación (`null` si no hay). El resultado
+    /// completo del escaneo nunca forma parte de esta entrada: se lee con
+    /// `GET /users/me/scans/{scan_id}/report`.
+    pub failure_reason: Option<String>,
+}
+
+/// Estado y resultado almacenado de un escaneo, tal como lo lee el endpoint
+/// del reporte. `result` es `None` mientras el escaneo no terminó con
+/// resultado (o si terminó `COMPLETADO` sin enviarlo).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredScanResult {
+    /// Estado actual del escaneo.
+    pub status: ScanStatus,
+    /// Resultado JSON guardado, si existe.
+    pub result: Option<serde_json::Value>,
 }
 
 /// Entrada inmutable del log de auditoría (RF-15): registra qué usuario
@@ -238,6 +255,7 @@ mod tests {
             status: ScanStatus::EnProgreso,
             requested_at: sample_timestamp(),
             updated_at: sample_timestamp(),
+            failure_reason: Some("host inalcanzable".to_string()),
         };
 
         let json = serde_json::to_string(&entry).expect("serializa");
@@ -285,6 +303,36 @@ mod tests {
             serde_json::to_string(&ScanStatus::Fallido).unwrap(),
             "\"FALLIDO\""
         );
+    }
+
+    #[test]
+    fn scan_status_cancelado_encoding_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&ScanStatus::Cancelado).unwrap(),
+            "\"CANCELADO\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ScanStatus>("\"CANCELADO\"").unwrap(),
+            ScanStatus::Cancelado
+        );
+    }
+
+    #[test]
+    fn scan_history_entry_serializes_absent_failure_reason_as_null() {
+        let entry = ScanHistoryEntry {
+            scan_id: "scan-1".to_string(),
+            user_id: "u".to_string(),
+            target: "192.0.2.10".to_string(),
+            status: ScanStatus::Completado,
+            requested_at: sample_timestamp(),
+            updated_at: sample_timestamp(),
+            failure_reason: None,
+        };
+
+        let value = serde_json::to_value(&entry).unwrap();
+
+        assert!(value["failure_reason"].is_null());
+        assert!(value.get("result").is_none());
     }
 
     #[test]

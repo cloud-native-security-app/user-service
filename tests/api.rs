@@ -1140,3 +1140,529 @@ async fn delete_network_credential_returns_404_for_another_users_entry() {
         .expect("GET scan-targets no debe fallar a nivel de transporte");
     assert_eq!(resolve.status(), StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// Feature `scan-report` (opción A): resultado, motivo de fallo y CANCELADO.
+// ---------------------------------------------------------------------------
+
+/// Crea el perfil de `user` y un escaneo; devuelve su `scan_id`.
+async fn create_scan_for(router: &Router, user: &str) -> String {
+    create_profile(router, user).await;
+    let request = request_to_with_headers(
+        "POST",
+        "/users/me/scans",
+        Some(user),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(json!({"target": "192.0.2.70"}).to_string()),
+    );
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("POST no debe fallar a nivel de transporte");
+    let created = body_json(response).await;
+    created["scan_id"].as_str().unwrap().to_string()
+}
+
+async fn patch_scan(router: &Router, user: &str, scan_id: &str, body: Value) -> Response {
+    let request = request_to_with_headers(
+        "PATCH",
+        &format!("/scans/{scan_id}"),
+        Some(user),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(body.to_string()),
+    );
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("PATCH no debe fallar a nivel de transporte")
+}
+
+async fn get_report(router: &Router, user: &str, scan_id: &str) -> Response {
+    let request = request_to_with_headers(
+        "GET",
+        &format!("/users/me/scans/{scan_id}/report"),
+        Some(user),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("GET report no debe fallar a nivel de transporte")
+}
+
+async fn get_history(router: &Router, user: &str) -> Value {
+    let request = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some(user),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("GET histórico no debe fallar a nivel de transporte");
+    body_json(response).await
+}
+
+fn sample_result() -> Value {
+    json!({
+        "ports": [{"port": 22, "protocol": "tcp", "state": "open", "service": "ssh",
+                   "version": "OpenSSH 9.6", "cpes": ["cpe:/a:openbsd:openssh:9.6"]}],
+        "vulnerabilities": [{"id": "CVE-2024-0001", "severity": "high", "source": "vulners"}]
+    })
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_completed_with_result_then_report_returns_the_result() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "report-owner").await;
+
+    let patch = patch_scan(
+        &router,
+        "report-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+    assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+
+    let report = get_report(&router, "report-owner", &scan_id).await;
+    assert_eq!(report.status(), StatusCode::OK);
+    assert_eq!(body_json(report).await, sample_result());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn history_entries_never_include_the_full_result() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "light-history").await;
+    patch_scan(
+        &router,
+        "light-history",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+
+    let history = get_history(&router, "light-history").await;
+
+    assert_eq!(history[0]["status"], "COMPLETADO");
+    assert!(
+        history[0].get("result").is_none(),
+        "el listado debe ser liviano"
+    );
+    assert!(history[0]["failure_reason"].is_null());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_failed_with_reason_is_listed_with_failure_reason() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "failed-owner").await;
+
+    let patch = patch_scan(
+        &router,
+        "failed-owner",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "host inalcanzable"}),
+    )
+    .await;
+    assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+
+    let history = get_history(&router, "failed-owner").await;
+    assert_eq!(history[0]["status"], "FALLIDO");
+    assert_eq!(history[0]["failure_reason"], "host inalcanzable");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_cancelled_is_accepted_and_listed_as_cancelado() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "cancel-owner").await;
+
+    let patch = patch_scan(
+        &router,
+        "cancel-owner",
+        &scan_id,
+        json!({"status": "CANCELADO", "failure_reason": "cancelado por el usuario"}),
+    )
+    .await;
+    assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+
+    let history = get_history(&router, "cancel-owner").await;
+    assert_eq!(history[0]["status"], "CANCELADO");
+    assert_eq!(history[0]["failure_reason"], "cancelado por el usuario");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_with_old_payload_without_new_fields_still_works() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "old-payload").await;
+
+    for status in ["EN_PROGRESO", "COMPLETADO", "FALLIDO"] {
+        let patch = patch_scan(&router, "old-payload", &scan_id, json!({"status": status})).await;
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT, "estado {status}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_rejects_result_on_a_non_completed_status() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "bad-result").await;
+
+    let patch = patch_scan(
+        &router,
+        "bad-result",
+        &scan_id,
+        json!({"status": "FALLIDO", "result": sample_result()}),
+    )
+    .await;
+
+    assert_eq!(patch.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_rejects_failure_reason_on_statuses_other_than_failed_or_cancelled() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "bad-reason").await;
+
+    for status in ["PENDIENTE", "EN_PROGRESO", "COMPLETADO"] {
+        let patch = patch_scan(
+            &router,
+            "bad-reason",
+            &scan_id,
+            json!({"status": status, "failure_reason": "no aplica"}),
+        )
+        .await;
+        assert_eq!(patch.status(), StatusCode::BAD_REQUEST, "estado {status}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_rejects_failure_reason_longer_than_500_chars_and_accepts_exactly_500() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "long-reason").await;
+
+    let too_long = patch_scan(
+        &router,
+        "long-reason",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "é".repeat(501)}),
+    )
+    .await;
+    assert_eq!(too_long.status(), StatusCode::BAD_REQUEST);
+
+    let at_limit = patch_scan(
+        &router,
+        "long-reason",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "é".repeat(500)}),
+    )
+    .await;
+    assert_eq!(at_limit.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_rejects_a_blank_failure_reason() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "blank-reason").await;
+
+    let patch = patch_scan(
+        &router,
+        "blank-reason",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "   "}),
+    )
+    .await;
+
+    assert_eq!(patch.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_rejects_a_result_that_is_not_a_json_object() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "array-result").await;
+
+    let patch = patch_scan(
+        &router,
+        "array-result",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": [1, 2, 3]}),
+    )
+    .await;
+
+    assert_eq!(patch.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_rejects_a_result_larger_than_256_kib_with_413() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "huge-result").await;
+    let huge = json!({"blob": "a".repeat(256 * 1024 + 1)});
+
+    let patch = patch_scan(
+        &router,
+        "huge-result",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": huge}),
+    )
+    .await;
+
+    assert_eq!(patch.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        get_report(&router, "huge-result", &scan_id).await.status(),
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_with_unknown_status_value_is_rejected() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "unknown-status").await;
+
+    let patch = patch_scan(
+        &router,
+        "unknown-status",
+        &scan_id,
+        json!({"status": "NO_EXISTE"}),
+    )
+    .await;
+
+    assert!(patch.status().is_client_error());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn report_returns_404_for_unknown_scan_and_for_another_users_scan() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "report-real-owner").await;
+    patch_scan(
+        &router,
+        "report-real-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+    create_profile(&router, "report-intruder").await;
+
+    let unknown = get_report(&router, "report-real-owner", "no-existe").await;
+    let foreign = get_report(&router, "report-intruder", &scan_id).await;
+
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn report_returns_409_when_the_scan_is_not_completed_or_has_no_result() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "report-not-ready").await;
+
+    let pending = get_report(&router, "report-not-ready", &scan_id).await;
+    assert_eq!(pending.status(), StatusCode::CONFLICT);
+
+    patch_scan(
+        &router,
+        "report-not-ready",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "x"}),
+    )
+    .await;
+    let failed = get_report(&router, "report-not-ready", &scan_id).await;
+    assert_eq!(failed.status(), StatusCode::CONFLICT);
+
+    patch_scan(
+        &router,
+        "report-not-ready",
+        &scan_id,
+        json!({"status": "COMPLETADO"}),
+    )
+    .await;
+    let completed_without_result = get_report(&router, "report-not-ready", &scan_id).await;
+    assert_eq!(completed_without_result.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn report_requires_gateway_secret_and_identity() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let no_secret = router
+        .clone()
+        .oneshot(request_to_with_headers(
+            "GET",
+            "/users/me/scans/x/report",
+            Some("someone"),
+            None,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let no_identity = router
+        .oneshot(request_to_with_headers(
+            "GET",
+            "/users/me/scans/x/report",
+            None,
+            Some(TEST_GATEWAY_SECRET),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(no_secret.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(no_identity.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn late_patch_after_a_terminal_status_is_a_204_noop_that_keeps_the_stored_data() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "terminal-owner").await;
+    patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+
+    let late = patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+    let repeat = patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": sample_result()}),
+    )
+    .await;
+    let contradictory = patch_scan(
+        &router,
+        "terminal-owner",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "tarde"}),
+    )
+    .await;
+
+    assert_eq!(late.status(), StatusCode::NO_CONTENT);
+    assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
+    assert_eq!(contradictory.status(), StatusCode::NO_CONTENT);
+    let history = get_history(&router, "terminal-owner").await;
+    assert_eq!(history[0]["status"], "COMPLETADO");
+    assert!(history[0]["failure_reason"].is_null());
+    let report = get_report(&router, "terminal-owner", &scan_id).await;
+    assert_eq!(report.status(), StatusCode::OK);
+    assert_eq!(body_json(report).await, sample_result());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn late_patch_after_failed_keeps_status_and_failure_reason() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "terminal-failed").await;
+    patch_scan(
+        &router,
+        "terminal-failed",
+        &scan_id,
+        json!({"status": "FALLIDO", "failure_reason": "host inalcanzable"}),
+    )
+    .await;
+
+    let late = patch_scan(
+        &router,
+        "terminal-failed",
+        &scan_id,
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+
+    assert_eq!(late.status(), StatusCode::NO_CONTENT);
+    let history = get_history(&router, "terminal-failed").await;
+    assert_eq!(history[0]["status"], "FALLIDO");
+    assert_eq!(history[0]["failure_reason"], "host inalcanzable");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patch_on_a_terminal_scan_still_returns_404_and_403_for_unknown_or_foreign() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "terminal-real").await;
+    create_profile(&router, "terminal-other").await;
+    patch_scan(
+        &router,
+        "terminal-real",
+        &scan_id,
+        json!({"status": "CANCELADO"}),
+    )
+    .await;
+
+    let foreign = patch_scan(
+        &router,
+        "terminal-other",
+        &scan_id,
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+    let unknown = patch_scan(
+        &router,
+        "terminal-real",
+        "no-existe",
+        json!({"status": "EN_PROGRESO"}),
+    )
+    .await;
+
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn not_found_error_body_is_generic() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let response = get_report(&router, "someone", "no-existe").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await,
+        json!({"error": "el recurso solicitado no existe"})
+    );
+}
