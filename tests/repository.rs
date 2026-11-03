@@ -324,6 +324,33 @@ async fn update_scan_outcome_persists_the_result_and_find_scan_result_returns_it
 
 #[tokio::test]
 #[ignore = "requiere Docker"]
+async fn scan_result_round_trips_vuln_finding_patch_state_verbatim() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    seed_scan(&repo, "test-user-ps1", "scan-ps1").await;
+    let result = serde_json::json!({
+        "ports": [],
+        "vulnerabilities": [
+            {"id": "CVE-2024-0001", "severity": "high", "patch_state": "fixed"},
+            {"id": "CVE-2024-0002", "severity": "high", "patch_state": "unpatched"},
+            {"id": "CVE-2024-0003", "severity": "low"},
+        ],
+    });
+
+    repo.update_scan_outcome("scan-ps1", ScanStatus::Completado, Some(&result), None)
+        .await
+        .expect("guardar el resultado debe funcionar");
+
+    let stored = repo
+        .find_scan_result("test-user-ps1", "scan-ps1")
+        .await
+        .expect("find_scan_result no debe fallar")
+        .expect("el resultado existe");
+    assert_eq!(stored.result, Some(result));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
 async fn update_scan_outcome_persists_failure_reason_for_failed_and_cancelled() {
     let db = start_test_db().await;
     let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
