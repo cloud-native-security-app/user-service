@@ -73,3 +73,27 @@ es una credencial SSH real de terceros: se cifra en reposo (AES-256-GCM,
 `From<RepoError> for ApiError` descartaba el error sin registrarlo, lo que
 ocultó un 500 en AWS. Ahora se loguea el error real en el servidor y el cliente
 sigue recibiendo un `ApiError::Internal` genérico.
+
+## ADR-012 Rol de usuario y administradores por configuración
+
+`users.role` (`user`/`admin`, `CHECK`, por defecto `user`) se expone en
+`GET`/`PUT /users/me` para que el Gateway lo incluya en su JWT (KAP-04/05).
+El rol nunca se acepta desde un cuerpo de petición: `upsert_user` no lo
+escribe y `PUT /users/me` ignora campos desconocidos, igual que `email`.
+
+**Decisión (suposición registrada):** `ADMIN_BOOTSTRAP_EMAILS` (separada por
+comas, sin distinguir mayúsculas; ausente o vacía = sin administradores) es
+**autoritativa**: un usuario es admin si y solo si su correo está en la lista.
+Se aplica de forma idempotente (a) al arrancar sobre todas las filas, y (b) en
+el aprovisionamiento del perfil, de modo que un usuario listado que entra por
+primera vez ya es admin. Quitar un correo revoca el rol en el siguiente
+arranque o en el siguiente aprovisionamiento de ese usuario. Una entrada que no
+tiene forma de correo, o un valor no UTF-8, es un error de configuración que
+impide arrancar (cierra en vez de interpretar mal la lista).
+
+Cada cambio de rol escribe `role.granted`/`role.revoked` en `audit_log`, en la
+misma transacción, con `target` igual al rol resultante y sin el correo. El rol
+de aplicación conserva `UPDATE` a nivel de tabla sobre `users` (la
+reconciliación corre con ese rol); la garantía de que no se escribe desde
+peticiones está en la aplicación y en sus tests. El correo proviene de la
+identidad verificada por el Gateway (`X-Forwarded-User`).

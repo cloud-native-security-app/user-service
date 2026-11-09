@@ -118,6 +118,7 @@ un error tipado explícito, nunca con un panic:
 | `HTTP_PORT` | Sí | Puerto en el que el servidor HTTP hace bind |
 | `GATEWAY_SHARED_SECRET` | Sí | Credencial compartida que autentica al Gateway como llamante de este servicio (ver `docs/security-scope.md`) |
 | `CREDENTIALS_ENCRYPTION_KEY` | Sí | Clave de cifrado en reposo (AES-256-GCM) de las credenciales SSH de red (feature `network_credentials_api`): 32 bytes codificados como hex de 64 caracteres. Tan sensible como `GATEWAY_SHARED_SECRET` — no debe commitearse ni loggearse (ver `docs/security-scope.md` §"Credenciales de red") |
+| `ADMIN_BOOTSTRAP_EMAILS` | No (ausente o vacía = sin administradores) | Correos de los administradores, separados por comas (se recortan espacios y no distingue mayúsculas). La lista es **autoritativa**: un usuario es `admin` si y solo si su correo está en ella. Se aplica (concede y revoca) al arrancar sobre los usuarios existentes y al aprovisionar el perfil (`PUT /users/me`). Una entrada que no sea un correo, o un valor que no sea UTF-8, impide el arranque. Cada cambio de rol queda en `audit_log` (`role.granted`/`role.revoked`) |
 | `MIGRATIONS_DATABASE_URL` | No (cae de vuelta a `DATABASE_URL` si está ausente) | URL de conexión usada **exclusivamente** para aplicar las migraciones al arrancar, con el rol "dueño" de las tablas |
 
 `MIGRATIONS_DATABASE_URL` existe porque `migrations/20260918120100_lock_audit_log_permissions.sql`
@@ -141,6 +142,7 @@ docker run --rm \
   -e HTTP_PORT=8080 \
   -e GATEWAY_SHARED_SECRET=change-me \
   -e CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -hex 32) \
+  -e ADMIN_BOOTSTRAP_EMAILS=admin@example.com \
   -p 8080:8080 \
   user-service:local
 ```
@@ -160,8 +162,8 @@ middleware interno antes de tocar la base de datos (ver
 
 | Método y ruta | Descripción |
 |---------------|-------------|
-| `PUT /users/me` | Crea o actualiza el perfil del llamante. Cuerpo: `{"display_name": "..."}` |
-| `GET /users/me` | Perfil del llamante; `404` si aún no tiene perfil |
+| `PUT /users/me` | Crea o actualiza el perfil del llamante. Cuerpo: `{"display_name": "..."}`; cualquier otro campo (incluido `role`) se ignora |
+| `GET /users/me` | Perfil del llamante (`user_id`, `email`, `display_name`, `role`, `created_at`); `404` si aún no tiene perfil. `role` es `"user"` o `"admin"` y lo lee el Gateway al iniciar sesión; nunca se acepta desde el cuerpo de una petición |
 | `POST /users/me/scans` | Registra una solicitud de escaneo (estado `Pendiente`) + su auditoría, en la misma transacción. Cuerpo: `{"target": "..."}` |
 | `GET /users/me/scans` | Histórico de escaneos del llamante. Cada entrada incluye `failure_reason` (`null` si no hay) y nunca el resultado completo. Estados: `PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO` |
 | `GET /users/me/scans/{scan_id}/report` | Resultado guardado de un escaneo propio (el JSON `ScanResult` tal cual). `404` si no existe o es de otro usuario, `409` si aún no está `COMPLETADO` con resultado |

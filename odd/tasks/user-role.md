@@ -40,14 +40,32 @@ Give each user a `role` (`user` or `admin`), expose it in the profile response t
 
 ## Checklist
 
-- [ ] UR-01 Feature doc.
-- [ ] UR-02 Migration, `Role`, `UserProfile.role`, role never client-settable (tests first).
-- [ ] UR-03 `AdminEmails`, config wiring, reconciliation at startup and provisioning, audit (tests first).
-- [ ] UR-04 README, migrations README, ADR-012, this doc closed.
+- [x] UR-01 Feature doc (a4ad81f).
+- [x] UR-02 Migration `20261109120000_add_user_role.sql`, `Role`, `UserProfile.role`, role never client-settable (76ac118).
+- [x] UR-03 `AdminEmails`, config wiring, reconciliation at startup and provisioning, audit `role.granted`/`role.revoked` (4152e6d); fail-closed on non-UTF-8 list and bootstrap failure logged (a5dbc65).
+- [x] UR-04 README (env var, profile contract), migrations README, ADR-012, this doc closed (docs commit on top of a5dbc65).
 
 ## Evidence
 
-(filled per task)
+- RED UR-02: `cargo test --no-run` failed to compile: `cannot find type Role`, `struct UserProfile has no field named role`, `unresolved import user_service::domain::Role`.
+- GREEN UR-02: `cargo test --lib` 49 passed; `cargo test -- --ignored` api 44, repository 36, service_wiring 2 passed; clippy `-D warnings` clean.
+- RED UR-03: `cargo test --no-run` failed: `cannot find value ADMIN_BOOTSTRAP_EMAILS_VAR` (config tests) and the missing `AdminEmails`, `with_admin_emails`, `sync_admin_roles`, `reconcile_user_role`.
+- GREEN UR-03: `cargo test --lib` 57 passed; `cargo test -- --ignored` api 47, repository 41, service_wiring 3 passed.
+- RED a5dbc65: `from_env_fails_closed_when_admin_bootstrap_emails_is_not_valid_utf8` panicked (non-UTF-8 value silently meant "no admins"); GREEN after `read_admin_emails`.
+- Final: `make verify` exit 0 (unit 58; integration api 47, repository 41, service_wiring 3). The `cargo doc` warning about `validate_scan_update` is pre-existing.
+- Review: the pre-commit hook (gga) passed on every commit; its non-blocking notes (UserRow doc, SQLSTATE 23514 assertion, bootstrap failure log, non-UTF-8 handling) were addressed. No native `gentle-ai review` was run by the writer; KAP-04 touches authorization, so the parent should decide whether to assess/review.
+
+## Design
+
+- `users.role` (`user`/`admin`); `Role` in `domain`, lowercase on the wire; `GET`/`PUT /users/me` return `role`.
+- `Repository::upsert_user` never writes `role`; `PUT /users/me` has no `role` field and ignores unknown ones.
+- `AdminEmails` (domain, `Debug` shows only the count) parsed by `Config` from `ADMIN_BOOTSTRAP_EMAILS`; `Repository::sync_admin_roles` (startup, in `wiring::build_router`) and `reconcile_user_role` (after `upsert_user` in `PUT /users/me`) run one `UPDATE ... RETURNING` plus audit inserts in a single transaction, only for rows whose role changes.
+- Audit: action `role.granted`/`role.revoked`, `user_id` the affected user, `target` the resulting role; no email.
+
+## Gaps
+
+- `GET /users/me` does not reconcile: a list change reaches a user at the next startup or the next `PUT /users/me` (the gateway provisions at login).
+- The migration comment explains why `ms_usuarios_app` keeps table-level `UPDATE` on `users` (A4).
 
 ## Next step
 
