@@ -133,11 +133,7 @@ impl Config {
         let gateway_shared_secret = SecretString::from(read_required(GATEWAY_SHARED_SECRET_VAR)?);
         let credentials_encryption_key =
             decode_encryption_key(&read_required(CREDENTIALS_ENCRYPTION_KEY_VAR)?)?;
-        let admin_bootstrap_emails =
-            AdminEmails::parse(&std::env::var(ADMIN_BOOTSTRAP_EMAILS_VAR).unwrap_or_default())
-                .map_err(|_| ConfigError::InvalidAdminEmails {
-                    variable: ADMIN_BOOTSTRAP_EMAILS_VAR,
-                })?;
+        let admin_bootstrap_emails = read_admin_emails()?;
         let migrations_database_url =
             std::env::var(MIGRATIONS_DATABASE_URL_VAR).unwrap_or_else(|_| database_url.clone());
 
@@ -178,6 +174,21 @@ fn decode_encryption_key(value: &str) -> Result<SecretSlice<u8>, ConfigError> {
         });
     }
     Ok(SecretBox::from(bytes.into_boxed_slice()))
+}
+
+/// Lee `ADMIN_BOOTSTRAP_EMAILS`: ausente = sin administradores. Un valor que
+/// no es UTF-8 válido o con una entrada que no es un correo falla (cierra en
+/// vez de interpretar mal la lista).
+fn read_admin_emails() -> Result<AdminEmails, ConfigError> {
+    let invalid = || ConfigError::InvalidAdminEmails {
+        variable: ADMIN_BOOTSTRAP_EMAILS_VAR,
+    };
+    let raw = match std::env::var(ADMIN_BOOTSTRAP_EMAILS_VAR) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    AdminEmails::parse(&raw).map_err(|_| invalid())
 }
 
 /// Lee una variable de entorno requerida, devolviendo un
@@ -439,6 +450,32 @@ mod tests {
         let debug_output = format!("{config:?}");
 
         assert!(!debug_output.contains("admin-1"));
+
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_env_fails_closed_when_admin_bootstrap_emails_is_not_valid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let guard = EnvGuard::set_valid_env();
+        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
+        unsafe {
+            std::env::set_var(
+                ADMIN_BOOTSTRAP_EMAILS_VAR,
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            );
+        }
+
+        let result = Config::from_env();
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidAdminEmails {
+                variable: ADMIN_BOOTSTRAP_EMAILS_VAR
+            })
+        ));
 
         drop(guard);
     }

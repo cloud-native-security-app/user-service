@@ -62,10 +62,11 @@ pub async fn build_router(config: &Config) -> Result<Router, WiringError> {
 
     // La lista es autoritativa: concede y revoca el rol de los usuarios que ya
     // existen antes de servir tráfico (idempotente).
-    let changed = repository
-        .sync_admin_roles()
-        .await
-        .map_err(|_| WiringError::AdminBootstrapFailed)?;
+    let changed = repository.sync_admin_roles().await.map_err(|error| {
+        // El detalle va solo al log del servidor (sin datos personales).
+        tracing::error!(%error, "no se pudo reconciliar los roles de administrador");
+        WiringError::AdminBootstrapFailed
+    })?;
     tracing::info!(changed, "roles de administrador reconciliados al arrancar");
 
     let api_router = api::router(repository, config.gateway_shared_secret.clone());
