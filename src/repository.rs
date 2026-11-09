@@ -36,7 +36,7 @@ use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::PgPool;
 
 use crate::domain::{
-    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus,
+    AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry, ScanStatus,
     StoredScanResult, UserProfile,
 };
 
@@ -69,6 +69,11 @@ impl Repository {
     /// `email`/`display_name` si ya existía (`created_at` del registro
     /// original se conserva).
     ///
+    /// Nunca escribe `role`: un perfil nuevo toma el valor por defecto
+    /// (`user`) y uno existente conserva el suyo, sea cual sea
+    /// `profile.role`. El rol solo cambia vía la reconciliación con
+    /// `ADMIN_BOOTSTRAP_EMAILS`.
+    ///
     /// # Errores
     ///
     /// Devuelve [`RepoError`] si la consulta falla (p. ej. sin conexión a
@@ -99,13 +104,13 @@ impl Repository {
     /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
     pub async fn find_user(&self, user_id: &str) -> Result<Option<UserProfile>, RepoError> {
         let row = sqlx::query_as::<_, UserRow>(
-            "SELECT user_id, email, display_name, created_at FROM users WHERE user_id = $1",
+            "SELECT user_id, email, display_name, role, created_at FROM users WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(UserProfile::from))
+        row.map(UserProfile::try_from).transpose()
     }
 
     /// Inserta una nueva entrada de histórico de escaneo (RF-13).
@@ -554,17 +559,23 @@ struct UserRow {
     user_id: String,
     email: String,
     display_name: String,
+    role: String,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<UserRow> for UserProfile {
-    fn from(row: UserRow) -> Self {
-        UserProfile {
+impl TryFrom<UserRow> for UserProfile {
+    type Error = RepoError;
+
+    /// Falla con [`RepoError::Backend`] si `role` no es un rol conocido
+    /// (la restricción `CHECK` ya lo impide; se maneja como error tipado).
+    fn try_from(row: UserRow) -> Result<Self, Self::Error> {
+        Ok(UserProfile {
             user_id: row.user_id,
             email: row.email,
             display_name: row.display_name,
+            role: Role::from_db_str(&row.role).ok_or(RepoError::Backend)?,
             created_at: row.created_at,
-        }
+        })
     }
 }
 

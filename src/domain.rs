@@ -13,6 +13,42 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Rol de un usuario. Es un enum cerrado: no existe un rol "desconocido" ni
+/// un valor por defecto silencioso al deserializar.
+///
+/// Codificación estable en minúsculas (`"user"`/`"admin"`), idéntica a la
+/// restricción `CHECK` de `users.role`. El rol nunca se acepta desde el
+/// cuerpo de una petición: solo lo asigna la reconciliación con
+/// `ADMIN_BOOTSTRAP_EMAILS` (ver `docs/decisions.md`, ADR-012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Usuario sin privilegios administrativos (valor por defecto en BD).
+    User,
+    /// Administrador.
+    Admin,
+}
+
+impl Role {
+    /// Valor textual estable, el mismo que se serializa y el que almacena
+    /// `users.role`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Admin => "admin",
+        }
+    }
+
+    /// Decodifica el `TEXT` de `users.role`; `None` si no es un rol conocido.
+    pub fn from_db_str(value: &str) -> Option<Role> {
+        match value {
+            "user" => Some(Role::User),
+            "admin" => Some(Role::Admin),
+            _ => None,
+        }
+    }
+}
+
 /// Perfil de un usuario autenticado.
 ///
 /// `user_id` es la identidad ya verificada por el Gateway/IDaaS (p. ej. el
@@ -29,6 +65,9 @@ pub struct UserProfile {
     pub email: String,
     /// Nombre visible del usuario. Dato personal.
     pub display_name: String,
+    /// Rol del usuario. Lo lee el Gateway al iniciar sesión. Solo de salida:
+    /// el repositorio nunca lo persiste desde un `UserProfile` recibido.
+    pub role: Role,
     /// Marca de tiempo en la que se creó el perfil en `ms-usuarios`.
     pub created_at: DateTime<Utc>,
 }
@@ -237,6 +276,7 @@ mod tests {
             user_id: "google-oauth2|123456".to_string(),
             email: "test-user-1@example.test".to_string(),
             display_name: "Test User".to_string(),
+            role: Role::Admin,
             created_at: sample_timestamp(),
         };
 
@@ -244,6 +284,38 @@ mod tests {
         let round_tripped: UserProfile = serde_json::from_str(&json).expect("deserializa");
 
         assert_eq!(profile, round_tripped);
+    }
+
+    #[test]
+    fn role_serializes_as_stable_lowercase_strings() {
+        assert_eq!(serde_json::to_value(Role::User).unwrap(), "user");
+        assert_eq!(serde_json::to_value(Role::Admin).unwrap(), "admin");
+        assert_eq!(Role::User.as_str(), "user");
+        assert_eq!(Role::Admin.as_str(), "admin");
+    }
+
+    #[test]
+    fn role_rejects_unknown_values_instead_of_defaulting() {
+        assert!(serde_json::from_str::<Role>("\"superuser\"").is_err());
+        assert!(serde_json::from_str::<Role>("\"ADMIN\"").is_err());
+        assert_eq!(Role::from_db_str("admin"), Some(Role::Admin));
+        assert_eq!(Role::from_db_str("user"), Some(Role::User));
+        assert_eq!(Role::from_db_str("root"), None);
+    }
+
+    #[test]
+    fn user_profile_json_exposes_the_role_field() {
+        let profile = UserProfile {
+            user_id: "u".to_string(),
+            email: "test-user-1@example.test".to_string(),
+            display_name: "Test User".to_string(),
+            role: Role::User,
+            created_at: sample_timestamp(),
+        };
+
+        let value = serde_json::to_value(&profile).expect("serializa");
+
+        assert_eq!(value["role"], "user");
     }
 
     #[test]

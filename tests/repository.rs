@@ -27,7 +27,7 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 use user_service::domain::{
-    AuditEntry, ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
+    AuditEntry, Role, ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
 };
 use user_service::repository::{parse_target, RepoError, Repository};
 use uuid::Uuid;
@@ -123,6 +123,7 @@ fn sample_profile(user_id: &str) -> UserProfile {
         user_id: user_id.to_string(),
         email: format!("{user_id}@example.test"),
         display_name: "Test User".to_string(),
+        role: Role::User,
         created_at: now_with_db_precision(),
     }
 }
@@ -1158,4 +1159,57 @@ async fn upsert_network_credential_for_an_unknown_user_fails_with_a_constraint_e
         matches!(result, Err(RepoError::Constraint(_))),
         "la FK user_id debe rechazar credenciales para usuarios inexistentes: {result:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn find_user_returns_the_default_user_role_for_a_new_profile() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+
+    repo.upsert_user(&sample_profile("role-default"))
+        .await
+        .expect("upsert");
+    let found = repo
+        .find_user("role-default")
+        .await
+        .expect("find")
+        .expect("existe");
+
+    assert_eq!(found.role, Role::User);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn upsert_user_never_persists_the_role_carried_by_the_profile() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let mut profile = sample_profile("role-escalation");
+    profile.role = Role::Admin;
+
+    repo.upsert_user(&profile).await.expect("insert");
+    repo.upsert_user(&profile).await.expect("update");
+    let found = repo
+        .find_user("role-escalation")
+        .await
+        .expect("find")
+        .expect("existe");
+
+    assert_eq!(found.role, Role::User);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn database_rejects_a_role_outside_user_and_admin() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    repo.upsert_user(&sample_profile("role-check"))
+        .await
+        .expect("upsert");
+
+    let result = sqlx::query("UPDATE users SET role = 'root' WHERE user_id = 'role-check'")
+        .execute(&db.app_pool)
+        .await;
+
+    assert!(result.is_err(), "el CHECK debe rechazar roles desconocidos");
 }

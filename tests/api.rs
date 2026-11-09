@@ -237,6 +237,72 @@ async fn put_then_get_reflects_the_stored_profile() {
 
 #[tokio::test]
 #[ignore = "requiere Docker"]
+async fn profile_response_exposes_the_default_user_role() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let put_response = router
+        .clone()
+        .oneshot(request_with_headers(
+            "PUT",
+            Some("role-default-user"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::from(json!({"display_name": "Test User"}).to_string()),
+        ))
+        .await
+        .expect("PUT");
+    assert_eq!(body_json(put_response).await["role"], "user");
+
+    let get_response = router
+        .oneshot(request_with_headers(
+            "GET",
+            Some("role-default-user"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::empty(),
+        ))
+        .await
+        .expect("GET");
+    assert_eq!(body_json(get_response).await["role"], "user");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn client_sent_admin_role_in_the_body_does_not_grant_admin() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    for body in [
+        json!({"display_name": "Mallory", "role": "admin"}),
+        json!({"display_name": "Mallory", "role": "admin", "user_id": "x", "email": "a@b.test"}),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(request_with_headers(
+                "PUT",
+                Some("role-mallory"),
+                Some(TEST_GATEWAY_SECRET),
+                Body::from(body.to_string()),
+            ))
+            .await
+            .expect("PUT");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["role"], "user");
+    }
+
+    let get_response = router
+        .oneshot(request_with_headers(
+            "GET",
+            Some("role-mallory"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::empty(),
+        ))
+        .await
+        .expect("GET");
+    assert_eq!(body_json(get_response).await["role"], "user");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
 async fn put_updates_email_and_display_name_on_a_second_call() {
     let db = start_test_db().await;
     let router = test_router(db.app_pool.clone());
