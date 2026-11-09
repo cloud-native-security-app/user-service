@@ -27,6 +27,7 @@ use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tower::ServiceExt;
 
 use user_service::api::{self, FORWARDED_USER_HEADER, GATEWAY_SECRET_HEADER};
+use user_service::domain::AdminEmails;
 use user_service::repository::Repository;
 
 /// Secreto de servicio sintético usado únicamente dentro de este test —
@@ -116,6 +117,15 @@ fn test_encryption_key() -> SecretSlice<u8> {
 fn test_router(pool: PgPool) -> Router {
     api::router(
         Repository::new(pool, test_encryption_key()),
+        SecretString::from(TEST_GATEWAY_SECRET.to_string()),
+    )
+}
+
+/// Igual que [`test_router`], con `ADMIN_BOOTSTRAP_EMAILS` ya parseada.
+fn test_router_with_admins(pool: PgPool, admin_emails: &str) -> Router {
+    api::router(
+        Repository::new(pool, test_encryption_key())
+            .with_admin_emails(AdminEmails::parse(admin_emails).expect("lista válida")),
         SecretString::from(TEST_GATEWAY_SECRET.to_string()),
     )
 }
@@ -1730,5 +1740,118 @@ async fn not_found_error_body_is_generic() {
     assert_eq!(
         body_json(response).await,
         json!({"error": "el recurso solicitado no existe"})
+    );
+}
+
+async fn put_profile_as(router: &Router, sub: &str, email: &str, body: Value) -> Value {
+    let response = router
+        .clone()
+        .oneshot(request_to_with_identity_header(
+            "PUT",
+            "/users/me",
+            Some(&identity_header(sub, email)),
+            Some(TEST_GATEWAY_SECRET),
+            Body::from(body.to_string()),
+        ))
+        .await
+        .expect("PUT");
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+async fn role_audit_actions(router: &Router, sub: &str) -> Vec<String> {
+    let response = router
+        .clone()
+        .oneshot(request_to_with_headers(
+            "GET",
+            "/users/me/audit",
+            Some(sub),
+            Some(TEST_GATEWAY_SECRET),
+            Body::empty(),
+        ))
+        .await
+        .expect("GET audit");
+    body_json(response)
+        .await
+        .as_array()
+        .expect("lista")
+        .iter()
+        .filter_map(|entry| entry["action"].as_str())
+        .filter(|action| action.starts_with("role."))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn first_login_of_a_listed_email_provisions_an_admin_and_audits_the_grant() {
+    let db = start_test_db().await;
+    let router = test_router_with_admins(db.app_pool.clone(), "Boss@Example.test");
+
+    let payload = put_profile_as(
+        &router,
+        "boss-sub",
+        "boss@example.test",
+        json!({"display_name": "Boss"}),
+    )
+    .await;
+
+    assert_eq!(payload["role"], "admin");
+    assert_eq!(
+        role_audit_actions(&router, "boss-sub").await,
+        ["role.granted"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn unlisted_email_stays_user_even_when_the_body_claims_admin() {
+    let db = start_test_db().await;
+    let router = test_router_with_admins(db.app_pool.clone(), "boss@example.test");
+
+    let payload = put_profile_as(
+        &router,
+        "intruder-sub",
+        "intruder@example.test",
+        json!({"display_name": "Intruder", "role": "admin"}),
+    )
+    .await;
+
+    assert_eq!(payload["role"], "user");
+    assert!(role_audit_actions(&router, "intruder-sub").await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn provisioning_again_does_not_duplicate_the_grant_and_a_removed_email_is_revoked() {
+    let db = start_test_db().await;
+    let listed = test_router_with_admins(db.app_pool.clone(), "boss@example.test");
+    for _ in 0..2 {
+        put_profile_as(
+            &listed,
+            "boss-sub",
+            "boss@example.test",
+            json!({"display_name": "Boss"}),
+        )
+        .await;
+    }
+    assert_eq!(
+        role_audit_actions(&listed, "boss-sub").await,
+        ["role.granted"]
+    );
+
+    let unlisted = test_router_with_admins(db.app_pool.clone(), "");
+    let payload = put_profile_as(
+        &unlisted,
+        "boss-sub",
+        "boss@example.test",
+        json!({"display_name": "Boss"}),
+    )
+    .await;
+
+    assert_eq!(payload["role"], "user");
+    assert_eq!(
+        role_audit_actions(&unlisted, "boss-sub").await,
+        ["role.granted", "role.revoked"]
     );
 }

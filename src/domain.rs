@@ -49,6 +49,88 @@ impl Role {
     }
 }
 
+/// Lista autoritativa de correos administradores (`ADMIN_BOOTSTRAP_EMAILS`).
+///
+/// Un usuario es administrador si y solo si su correo está en la lista
+/// (comparación sin distinguir mayúsculas). Los correos son datos personales:
+/// el `Debug` solo muestra la cantidad, nunca las direcciones.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct AdminEmails(std::collections::BTreeSet<String>);
+
+/// Error de [`AdminEmails::parse`]. No incluye el valor rechazado, que puede
+/// ser un correo real mal escrito.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AdminEmailsError {
+    /// Una entrada no tiene forma de correo electrónico.
+    #[error("una entrada de la lista de administradores no es un correo válido")]
+    InvalidEntry,
+}
+
+impl AdminEmails {
+    /// Parsea una lista separada por comas: recorta espacios, pasa a
+    /// minúsculas y omite las entradas vacías (una lista vacía significa "sin
+    /// administradores").
+    ///
+    /// # Errores
+    ///
+    /// [`AdminEmailsError::InvalidEntry`] si alguna entrada no vacía no tiene
+    /// forma de correo (`local@dominio.tld`, sin espacios ni un segundo `@`).
+    pub fn parse(raw: &str) -> Result<Self, AdminEmailsError> {
+        let mut emails = std::collections::BTreeSet::new();
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            if !has_email_shape(entry) {
+                return Err(AdminEmailsError::InvalidEntry);
+            }
+            emails.insert(entry.to_lowercase());
+        }
+        Ok(Self(emails))
+    }
+
+    /// Indica si `email` figura en la lista (sin distinguir mayúsculas).
+    pub fn contains(&self, email: &str) -> bool {
+        self.0.contains(&email.trim().to_lowercase())
+    }
+
+    /// Cantidad de correos en la lista.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `true` si la lista está vacía (no hay administradores).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Correos en minúsculas, para pasarlos como parámetro de consulta.
+    pub fn to_lowercase_vec(&self) -> Vec<String> {
+        self.0.iter().cloned().collect()
+    }
+}
+
+impl fmt::Debug for AdminEmails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminEmails")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
+/// Forma mínima de correo: un único `@`, parte local no vacía, dominio con al
+/// menos dos etiquetas no vacías y sin espacios.
+fn has_email_shape(value: &str) -> bool {
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    let labels: Vec<&str> = domain.split('.').collect();
+    !local.is_empty()
+        && !domain.contains('@')
+        && labels.len() >= 2
+        && labels.iter().all(|label| !label.is_empty())
+}
+
 /// Perfil de un usuario autenticado.
 ///
 /// `user_id` es la identidad ya verificada por el Gateway/IDaaS (p. ej. el
@@ -316,6 +398,55 @@ mod tests {
         let value = serde_json::to_value(&profile).expect("serializa");
 
         assert_eq!(value["role"], "user");
+    }
+
+    #[test]
+    fn admin_emails_parse_trims_lowercases_and_skips_empty_entries() {
+        let admins = AdminEmails::parse("  Admin-1@Example.test , ,admin-2@example.test,")
+            .expect("lista válida");
+
+        assert_eq!(admins.len(), 2);
+        assert!(admins.contains("admin-1@example.test"));
+        assert!(admins.contains("ADMIN-2@EXAMPLE.TEST"));
+        assert!(!admins.contains("admin-3@example.test"));
+    }
+
+    #[test]
+    fn admin_emails_parse_of_empty_input_means_no_admins() {
+        for raw in ["", "   ", " , ,"] {
+            let admins = AdminEmails::parse(raw).expect("lista vacía válida");
+            assert!(admins.is_empty());
+            assert!(!admins.contains("anyone@example.test"));
+        }
+        assert!(AdminEmails::default().is_empty());
+    }
+
+    #[test]
+    fn admin_emails_parse_rejects_entries_that_are_not_an_email_shape() {
+        for raw in [
+            "not-an-email",
+            "@example.test",
+            "user@",
+            "user@nodot",
+            "a b@example.test",
+            "a@b@example.test",
+            "ok@example.test,broken",
+        ] {
+            assert_eq!(
+                AdminEmails::parse(raw),
+                Err(AdminEmailsError::InvalidEntry),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_emails_debug_never_prints_the_addresses() {
+        let admins = AdminEmails::parse("admin-1@example.test").expect("válida");
+
+        let debug = format!("{admins:?}");
+
+        assert!(!debug.contains("admin-1"));
     }
 
     #[test]

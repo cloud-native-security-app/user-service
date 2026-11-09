@@ -271,6 +271,14 @@ async fn put_profile(
         .await
         .map_err(ApiError::from)?;
 
+    // La lista `ADMIN_BOOTSTRAP_EMAILS` decide el rol (concede o revoca) con
+    // el correo verificado por el Gateway; el cuerpo nunca interviene.
+    state
+        .repository
+        .reconcile_user_role(&profile.user_id)
+        .await
+        .map_err(ApiError::from)?;
+
     let stored = state
         .repository
         .find_user(&profile.user_id)

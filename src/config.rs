@@ -11,6 +11,8 @@ use std::fmt;
 
 use secrecy::{SecretBox, SecretSlice, SecretString};
 
+use crate::domain::AdminEmails;
+
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
 
@@ -36,6 +38,10 @@ const MIGRATIONS_DATABASE_URL_VAR: &str = "MIGRATIONS_DATABASE_URL";
 /// hex (64 caracteres). Se trata como configuración sensible del mismo
 /// nivel que `GATEWAY_SHARED_SECRET` — nunca se hardcodea, nunca se loggea.
 const CREDENTIALS_ENCRYPTION_KEY_VAR: &str = "CREDENTIALS_ENCRYPTION_KEY";
+
+/// Nombre de la variable de entorno, **opcional**, con los correos de los
+/// administradores separados por comas (ver [`Config::admin_bootstrap_emails`]).
+const ADMIN_BOOTSTRAP_EMAILS_VAR: &str = "ADMIN_BOOTSTRAP_EMAILS";
 
 /// Configuración del servicio `ms-usuarios`, cargada desde variables de
 /// entorno mediante [`Config::from_env`].
@@ -71,6 +77,12 @@ pub struct Config {
     /// persistirla y descifrarla solo al resolver un objetivo — nunca se
     /// loggea (redactada por [`SecretBox`] en `Debug`).
     pub credentials_encryption_key: SecretSlice<u8>,
+    /// Lista autoritativa de administradores, leída de
+    /// `ADMIN_BOOTSTRAP_EMAILS` (separada por comas; ausente o vacía = sin
+    /// administradores): un usuario es admin si y solo si su correo está
+    /// aquí. Se aplica al arrancar y al aprovisionar el perfil. Su `Debug`
+    /// solo muestra la cantidad.
+    pub admin_bootstrap_emails: AdminEmails,
 }
 
 impl fmt::Debug for Config {
@@ -90,6 +102,7 @@ impl fmt::Debug for Config {
                 "credentials_encryption_key",
                 &self.credentials_encryption_key,
             )
+            .field("admin_bootstrap_emails", &self.admin_bootstrap_emails)
             .finish()
     }
 }
@@ -99,6 +112,9 @@ impl Config {
     ///
     /// Variables requeridas: `DATABASE_URL`, `HTTP_HOST`, `HTTP_PORT`,
     /// `GATEWAY_SHARED_SECRET` y `CREDENTIALS_ENCRYPTION_KEY`.
+    /// `ADMIN_BOOTSTRAP_EMAILS` es **opcional** (ausente = sin
+    /// administradores); una entrada que no sea un correo es un error de
+    /// configuración ([`ConfigError::InvalidAdminEmails`]).
     /// `MIGRATIONS_DATABASE_URL` es **opcional**: si está ausente,
     /// [`Config::migrations_database_url`] cae de vuelta al valor de
     /// `DATABASE_URL`.
@@ -117,6 +133,11 @@ impl Config {
         let gateway_shared_secret = SecretString::from(read_required(GATEWAY_SHARED_SECRET_VAR)?);
         let credentials_encryption_key =
             decode_encryption_key(&read_required(CREDENTIALS_ENCRYPTION_KEY_VAR)?)?;
+        let admin_bootstrap_emails =
+            AdminEmails::parse(&std::env::var(ADMIN_BOOTSTRAP_EMAILS_VAR).unwrap_or_default())
+                .map_err(|_| ConfigError::InvalidAdminEmails {
+                    variable: ADMIN_BOOTSTRAP_EMAILS_VAR,
+                })?;
         let migrations_database_url =
             std::env::var(MIGRATIONS_DATABASE_URL_VAR).unwrap_or_else(|_| database_url.clone());
 
@@ -133,6 +154,7 @@ impl Config {
             gateway_shared_secret,
             credentials_encryption_key,
             migrations_database_url,
+            admin_bootstrap_emails,
         })
     }
 }
@@ -195,6 +217,13 @@ pub enum ConfigError {
         /// Nombre de la variable de entorno con el valor inválido.
         variable: &'static str,
     },
+    /// Alguna entrada de `ADMIN_BOOTSTRAP_EMAILS` no es un correo válido. No
+    /// incluye el valor, que puede ser un correo real mal escrito.
+    #[error("la variable de entorno {variable} contiene una entrada que no es un correo válido")]
+    InvalidAdminEmails {
+        /// Nombre de la variable de entorno con el valor inválido.
+        variable: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -248,6 +277,7 @@ mod tests {
                 std::env::remove_var(GATEWAY_SHARED_SECRET_VAR);
                 std::env::remove_var(MIGRATIONS_DATABASE_URL_VAR);
                 std::env::remove_var(CREDENTIALS_ENCRYPTION_KEY_VAR);
+                std::env::remove_var(ADMIN_BOOTSTRAP_EMAILS_VAR);
             }
         }
     }
@@ -328,6 +358,87 @@ mod tests {
                 variable: CREDENTIALS_ENCRYPTION_KEY_VAR
             })
         ));
+
+        drop(guard);
+    }
+
+    #[test]
+    fn from_env_defaults_to_no_admins_when_admin_bootstrap_emails_is_unset_or_empty() {
+        let guard = EnvGuard::set_valid_env();
+
+        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        assert!(config.admin_bootstrap_emails.is_empty());
+
+        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
+        unsafe {
+            std::env::set_var(ADMIN_BOOTSTRAP_EMAILS_VAR, "  ");
+        }
+        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        assert!(config.admin_bootstrap_emails.is_empty());
+
+        drop(guard);
+    }
+
+    #[test]
+    fn from_env_loads_admin_bootstrap_emails_trimmed_and_case_insensitive() {
+        let guard = EnvGuard::set_valid_env();
+        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
+        unsafe {
+            std::env::set_var(
+                ADMIN_BOOTSTRAP_EMAILS_VAR,
+                " Admin-1@Example.test, admin-2@example.test ",
+            );
+        }
+
+        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+
+        assert_eq!(config.admin_bootstrap_emails.len(), 2);
+        assert!(config
+            .admin_bootstrap_emails
+            .contains("admin-1@example.test"));
+        assert!(config
+            .admin_bootstrap_emails
+            .contains("ADMIN-2@example.test"));
+
+        drop(guard);
+    }
+
+    #[test]
+    fn from_env_returns_typed_error_without_the_value_when_an_admin_email_is_invalid() {
+        let guard = EnvGuard::set_valid_env();
+        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
+        unsafe {
+            std::env::set_var(
+                ADMIN_BOOTSTRAP_EMAILS_VAR,
+                "admin-1@example.test,secret-typo",
+            );
+        }
+
+        let error = Config::from_env().expect_err("una entrada inválida debe fallar");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidAdminEmails {
+                variable: ADMIN_BOOTSTRAP_EMAILS_VAR
+            }
+        ));
+        assert!(!error.to_string().contains("secret-typo"));
+
+        drop(guard);
+    }
+
+    #[test]
+    fn debug_format_of_config_never_contains_admin_emails() {
+        let guard = EnvGuard::set_valid_env();
+        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
+        unsafe {
+            std::env::set_var(ADMIN_BOOTSTRAP_EMAILS_VAR, "admin-1@example.test");
+        }
+        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains("admin-1"));
 
         drop(guard);
     }

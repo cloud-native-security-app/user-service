@@ -57,7 +57,16 @@ pub async fn build_router(config: &Config) -> Result<Router, WiringError> {
         .map_err(|_| WiringError::DatabaseConnectionFailed)?;
 
     let health_pool = database_pool.clone();
-    let repository = Repository::new(database_pool, config.credentials_encryption_key.clone());
+    let repository = Repository::new(database_pool, config.credentials_encryption_key.clone())
+        .with_admin_emails(config.admin_bootstrap_emails.clone());
+
+    // La lista es autoritativa: concede y revoca el rol de los usuarios que ya
+    // existen antes de servir tráfico (idempotente).
+    let changed = repository
+        .sync_admin_roles()
+        .await
+        .map_err(|_| WiringError::AdminBootstrapFailed)?;
+    tracing::info!(changed, "roles de administrador reconciliados al arrancar");
 
     let api_router = api::router(repository, config.gateway_shared_secret.clone());
     let health_router = Router::new()
@@ -111,6 +120,10 @@ pub enum WiringError {
     /// No se pudo conectar a la base de datos con el pool de aplicación.
     #[error("no se pudo conectar a la base de datos de aplicación")]
     DatabaseConnectionFailed,
+    /// No se pudo reconciliar el rol de administrador con
+    /// `ADMIN_BOOTSTRAP_EMAILS`.
+    #[error("fallo al reconciliar los roles de administrador")]
+    AdminBootstrapFailed,
 }
 
 #[cfg(test)]
@@ -149,6 +162,7 @@ mod tests {
             gateway_shared_secret: SecretString::from("test-secret".to_string()),
             credentials_encryption_key: SecretBox::from(vec![0x07u8; 32].into_boxed_slice()),
             migrations_database_url: UNREACHABLE_URL.to_string(),
+            admin_bootstrap_emails: Default::default(),
         };
 
         let result = build_router(&config).await;
