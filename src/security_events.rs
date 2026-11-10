@@ -504,11 +504,15 @@ mod tests {
     }
 
     /// Publicador que nunca responde: ejercita el tope de tiempo.
-    struct HangingPublisher;
+    #[derive(Default)]
+    struct HangingPublisher {
+        calls: AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl SecurityEventPublisher for HangingPublisher {
         async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }
     }
@@ -576,14 +580,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn emit_gives_up_on_a_publisher_that_never_answers_after_the_timeout() {
-        let port: Arc<dyn SecurityEventPublisher> = Arc::new(HangingPublisher);
-        emit(
+        let hanging = Arc::new(HangingPublisher::default());
+        let port: Arc<dyn SecurityEventPublisher> = hanging.clone();
+        emit_all(
             &port,
-            SecurityEvent::audit_recorded("a", "role.granted", "user"),
+            vec![
+                SecurityEvent::audit_recorded("a", "role.granted", "user"),
+                SecurityEvent::audit_recorded("b", "role.granted", "user"),
+            ],
         );
         // Con el reloj pausado, `sleep` adelanta el tiempo virtual sin esperar:
-        // la tarea desacoplada vence su tope y termina sin colgar el runtime.
+        // la tarea desacoplada vence su tope y descarta el resto del lote.
         tokio::time::sleep(PUBLISH_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(PUBLISH_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert_eq!(hanging.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

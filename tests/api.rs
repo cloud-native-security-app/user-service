@@ -13,6 +13,8 @@
 //! bajo prueba — así el router se ejercita con los mismos permisos de base
 //! de datos con los que corre en producción.
 
+use std::sync::Arc;
+
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
@@ -29,6 +31,9 @@ use tower::ServiceExt;
 use user_service::api::{self, FORWARDED_USER_HEADER, GATEWAY_SECRET_HEADER};
 use user_service::domain::AdminEmails;
 use user_service::repository::Repository;
+use user_service::security_events::{
+    RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError, SecurityEventPublisher,
+};
 
 /// Secreto de servicio sintético usado únicamente dentro de este test —
 /// nunca una credencial real (ver `docs/security-scope.md`).
@@ -1854,4 +1859,115 @@ async fn provisioning_again_does_not_duplicate_the_grant_and_a_removed_email_is_
         role_audit_actions(&unlisted, "boss-sub").await,
         ["role.granted", "role.revoked"]
     );
+}
+
+// --- KAP-08: un publicador de eventos caído no cambia ninguna respuesta ---
+
+/// Publicador que siempre falla (Kinesis caído).
+struct FailingPublisher;
+
+#[async_trait::async_trait]
+impl SecurityEventPublisher for FailingPublisher {
+    async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+        Err(SecurityEventError::PublishFailed("kinesis caído".into()))
+    }
+}
+
+fn router_with_publisher(
+    pool: PgPool,
+    admin_emails: &str,
+    publisher: Arc<dyn SecurityEventPublisher>,
+) -> Router {
+    api::router(
+        Repository::new(pool, test_encryption_key())
+            .with_admin_emails(AdminEmails::parse(admin_emails).expect("lista válida"))
+            .with_security_events(publisher),
+        SecretString::from(TEST_GATEWAY_SECRET.to_string()),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn post_scan_with_a_failing_publisher_still_answers_200_and_keeps_the_audit_row() {
+    let db = start_test_db().await;
+    let router = router_with_publisher(db.app_pool.clone(), "", Arc::new(FailingPublisher));
+    create_profile(&router, "failing-scan-owner").await;
+
+    let response = router
+        .clone()
+        .oneshot(request_to_with_headers(
+            "POST",
+            "/users/me/scans",
+            Some("failing-scan-owner"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::from(json!({"target": "192.0.2.60"}).to_string()),
+        ))
+        .await
+        .expect("POST scan");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let audit = router
+        .oneshot(request_to_with_headers(
+            "GET",
+            "/users/me/audit",
+            Some("failing-scan-owner"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::empty(),
+        ))
+        .await
+        .expect("GET audit");
+    let audit = body_json(audit).await;
+    assert_eq!(audit.as_array().expect("lista").len(), 1);
+    assert_eq!(audit[0]["action"], "scan_requested");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn first_login_with_a_failing_publisher_still_provisions_the_admin() {
+    let db = start_test_db().await;
+    let router = router_with_publisher(
+        db.app_pool.clone(),
+        "boss-failing@example.test",
+        Arc::new(FailingPublisher),
+    );
+
+    let payload = put_profile_as(
+        &router,
+        "boss-failing-sub",
+        "boss-failing@example.test",
+        json!({"display_name": "Boss"}),
+    )
+    .await;
+
+    assert_eq!(payload["role"], "admin");
+    assert_eq!(
+        role_audit_actions(&router, "boss-failing-sub").await,
+        ["role.granted"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn post_scan_emits_scan_requested_with_the_caller_as_actor_sub() {
+    let db = start_test_db().await;
+    let recorder = Arc::new(RecordingSecurityEventPublisher::new());
+    let router = router_with_publisher(db.app_pool.clone(), "", recorder.clone());
+    create_profile(&router, "event-scan-owner").await;
+
+    let response = router
+        .oneshot(request_to_with_headers(
+            "POST",
+            "/users/me/scans",
+            Some("event-scan-owner"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::from(json!({"target": "192.0.2.61"}).to_string()),
+        ))
+        .await
+        .expect("POST scan");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = recorder.wait_for(1).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor_sub(), Some("event-scan-owner"));
+    assert_eq!(events[0].payload()["action"], "scan.requested");
 }
