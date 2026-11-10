@@ -67,6 +67,20 @@ Give each user a `role` (`user` or `admin`), expose it in the profile response t
 - `GET /users/me` does not reconcile: a list change reaches a user at the next startup or the next `PUT /users/me` (the gateway provisions at login).
 - The migration comment explains why `ms_usuarios_app` keeps table-level `UPDATE` on `users` (A4).
 
+## Review
+
+- 2026-11-10: native review granted by the user (medium risk, 14 files, 1054 lines, base `origin/develop`). One consolidated `review-reliability` lens. Result: **approved**, acknowledged (lineage `review-aef53cf2e093d082`). Three non-blocking advisory findings, kept as follow-ups:
+  - R3-rolling-deploy-role-flapping (WARNING, `src/api.rs:274-280`): during a rolling deploy or a list change, replicas with different `ADMIN_BOOTSTRAP_EMAILS` reconcile in opposite directions on `PUT /users/me`, so a role can flip per replica and write extra audit entries.
+  - R3-trim-lower-mismatch (SUGGESTION, `src/repository.rs:113-116`): `AdminEmails::contains` trims and uses Unicode lowercase; the SQL reconciliation uses `lower(email)` without trim. Normalize in one place or add a test with mixed case and surrounding whitespace.
+  - R3-weak-append-only-assertion (SUGGESTION, `tests/repository.rs:1347`).
+
+## Flaky unit test investigation
+
+- Observed once: `cargo test --lib` reported `57 passed; 1 failed` right after the feature landed; the failing test name was not captured. Not reproduced in 26 later runs (7 sequential, 18 in parallel batches of 6, plus each test run alone).
+- Suspect 1: `wiring::tests::build_router_returns_typed_error_when_migrations_database_is_unreachable` takes 30 s on every run because `migrate()` connects without `acquire_timeout`, so it relies on the sqlx default 30 s connect retry loop. Pre-existing (not introduced by KAP-04) and timing-dependent.
+- Suspect 2: `config` tests mutate the process environment with `unsafe` `set_var`/`remove_var`. `ENV_MUTEX` serializes them against each other, but not against other tests in the same binary that may read the environment through C code (sqlx connection options, DNS resolution). KAP-04 added five more such tests, which raises the odds of a rare interleaving.
+- Proposed fix (separate branch): give `migrate()` a short configurable `acquire_timeout`, and make `Config` loading testable without touching the global environment (a lookup function injected into `from_env`), so no test mutates the process env.
+
 ## Next step
 
 KAP-05 in `gateway`: read `role` from `GET /users/me` at login and put it in the JWT.
