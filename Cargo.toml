@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 axum = "0.7"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "json"] }
 tracing = "0.1"
@@ -20,10 +20,18 @@ aes-gcm = "0.10"
 ipnetwork = "0.20"
 hex = "0.4"
 rand = "0.8"
+# Puerto `SecurityEventPublisher` (`src/security_events.rs`, KAP-08): trait async
+# detrás de `Arc<dyn ...>`, igual que en gateway y nmap-service.
+async-trait = "0.1"
 
 [dev-dependencies]
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+# `start_paused` para probar el tope de tiempo de `emit` sin esperas de reloj.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Valida cada evento emitido contra `../broker/contracts/security-event.schema.json`
+# (`tests/security_event_contract.rs`). Misma versión y features que nmap-service.
+jsonschema = { version = "0.56", default-features = false }
