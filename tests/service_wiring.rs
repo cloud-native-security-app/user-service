@@ -139,6 +139,9 @@ async fn start_running_service_with(
         migrations_database_url: superuser_url,
         admin_bootstrap_emails: user_service::domain::AdminEmails::parse(admin_emails)
             .expect("lista de administradores válida"),
+        security_events_stream_name: None,
+        aws_region: None,
+        aws_endpoint_url: None,
     };
 
     let app = wiring::build_router(&config)

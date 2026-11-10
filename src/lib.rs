@@ -17,6 +17,7 @@ pub mod api;
 pub mod audit;
 pub mod config;
 pub mod domain;
+pub mod messaging;
 pub mod repository;
 pub mod security_events;
 pub mod wiring;

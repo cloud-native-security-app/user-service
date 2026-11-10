@@ -44,6 +44,22 @@ const CREDENTIALS_ENCRYPTION_KEY_VAR: &str = "CREDENTIALS_ENCRYPTION_KEY";
 /// administradores separados por comas (ver [`Config::admin_bootstrap_emails`]).
 const ADMIN_BOOTSTRAP_EMAILS_VAR: &str = "ADMIN_BOOTSTRAP_EMAILS";
 
+/// Nombre de la variable de entorno, **opcional**, con el nombre del Kinesis
+/// Data Stream de eventos de seguridad (`security-events`). Ausente o en
+/// blanco desactiva la publicación (adaptador no-op).
+pub const SECURITY_EVENTS_STREAM_NAME_VAR: &str = "SECURITY_EVENTS_STREAM_NAME";
+
+/// Nombre de la variable de entorno, **opcional**, con la región AWS del
+/// cliente Kinesis. Si falta, la resuelve la cadena por defecto de AWS.
+pub const AWS_REGION_VAR: &str = "AWS_REGION";
+
+/// Nombre de la variable de entorno, **opcional**, con el endpoint AWS
+/// alternativo (solo LocalStack/desarrollo). Ausente en AWS real.
+pub const AWS_ENDPOINT_URL_VAR: &str = "AWS_ENDPOINT_URL";
+
+/// Largo máximo de un nombre de stream de Kinesis.
+const MAX_STREAM_NAME_CHARS: usize = 128;
+
 /// Configuración del servicio `ms-usuarios`, cargada desde variables de
 /// entorno mediante [`Config::from_env`].
 ///
@@ -84,6 +100,15 @@ pub struct Config {
     /// aquí. Se aplica al arrancar y al aprovisionar el perfil. Su `Debug`
     /// solo muestra la cantidad.
     pub admin_bootstrap_emails: AdminEmails,
+    /// Nombre del Kinesis Data Stream de eventos de seguridad. `None`
+    /// (variable ausente o en blanco) desactiva la publicación. Ver
+    /// [`SECURITY_EVENTS_STREAM_NAME_VAR`].
+    pub security_events_stream_name: Option<String>,
+    /// Región AWS del cliente Kinesis, si se indicó. Ver [`AWS_REGION_VAR`].
+    pub aws_region: Option<String>,
+    /// Endpoint AWS alternativo (solo LocalStack), si se indicó. Ver
+    /// [`AWS_ENDPOINT_URL_VAR`].
+    pub aws_endpoint_url: Option<String>,
 }
 
 impl fmt::Debug for Config {
@@ -104,6 +129,12 @@ impl fmt::Debug for Config {
                 &self.credentials_encryption_key,
             )
             .field("admin_bootstrap_emails", &self.admin_bootstrap_emails)
+            .field(
+                "security_events_stream_name",
+                &self.security_events_stream_name,
+            )
+            .field("aws_region", &self.aws_region)
+            .field("aws_endpoint_url", &self.aws_endpoint_url)
             .finish()
     }
 }
@@ -158,6 +189,10 @@ impl Config {
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| database_url.clone());
 
+        let security_events_stream_name = read_stream_name(&lookup)?;
+        let aws_region = read_optional(&lookup, AWS_REGION_VAR);
+        let aws_endpoint_url = read_optional(&lookup, AWS_ENDPOINT_URL_VAR);
+
         let http_port = raw_http_port
             .parse::<u16>()
             .map_err(|_| ConfigError::InvalidPort {
@@ -172,6 +207,9 @@ impl Config {
             credentials_encryption_key,
             migrations_database_url,
             admin_bootstrap_emails,
+            security_events_stream_name,
+            aws_region,
+            aws_endpoint_url,
         })
     }
 }
@@ -213,6 +251,47 @@ fn read_admin_emails(
     AdminEmails::parse(&raw).map_err(|_| invalid())
 }
 
+/// Lee una variable opcional: recorta espacios y trata ausente, en blanco o
+/// no UTF-8 como no definida.
+fn read_optional(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+    variable: &'static str,
+) -> Option<String> {
+    lookup(variable)
+        .and_then(|value| value.into_string().ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Lee `SECURITY_EVENTS_STREAM_NAME`: ausente o en blanco = sin publicación.
+/// Un valor que no es un nombre de stream de Kinesis (`[a-zA-Z0-9_.-]`, hasta
+/// 128 caracteres) o que no es UTF-8 falla el arranque; el error nombra la
+/// variable, nunca el valor.
+fn read_stream_name(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<String>, ConfigError> {
+    let invalid = || ConfigError::InvalidStreamName {
+        variable: SECURITY_EVENTS_STREAM_NAME_VAR,
+    };
+    let Some(raw) = lookup(SECURITY_EVENTS_STREAM_NAME_VAR) else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| invalid())?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let valid = value.chars().count() <= MAX_STREAM_NAME_CHARS
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if valid {
+        Ok(Some(value.to_owned()))
+    } else {
+        Err(invalid())
+    }
+}
+
 /// Lee una variable de entorno requerida, devolviendo un
 /// [`ConfigError::MissingVar`] tipado (nunca un panic) si está ausente o no
 /// es UTF-8 válido.
@@ -252,6 +331,13 @@ pub enum ConfigError {
          (hex de 64 caracteres)"
     )]
     InvalidEncryptionKey {
+        /// Nombre de la variable de entorno con el valor inválido.
+        variable: &'static str,
+    },
+    /// `SECURITY_EVENTS_STREAM_NAME` no es un nombre de stream de Kinesis
+    /// válido. No incluye el valor.
+    #[error("la variable de entorno {variable} no contiene un nombre de stream de Kinesis válido")]
+    InvalidStreamName {
         /// Nombre de la variable de entorno con el valor inválido.
         variable: &'static str,
     },
@@ -541,5 +627,74 @@ mod tests {
             !debug_output.contains(encryption_key_hex()),
             "el Debug de Config no debe filtrar la clave de cifrado de credenciales"
         );
+    }
+
+    #[test]
+    fn security_events_are_disabled_when_the_stream_name_is_unset_or_blank() {
+        let config = FakeEnv::valid().load().expect("config válida");
+        assert_eq!(config.security_events_stream_name, None);
+        for blank in ["", "   ", "\t"] {
+            let mut env = FakeEnv::valid();
+            env.set(SECURITY_EVENTS_STREAM_NAME_VAR, blank);
+            let config = env.load().expect("config válida");
+            assert_eq!(
+                config.security_events_stream_name, None,
+                "{blank:?} debe tratarse como no definida"
+            );
+        }
+    }
+
+    #[test]
+    fn security_events_stream_name_is_trimmed_and_loaded() {
+        let mut env = FakeEnv::valid();
+        env.set(SECURITY_EVENTS_STREAM_NAME_VAR, " security-events ");
+        let config = env.load().expect("config válida");
+        assert_eq!(
+            config.security_events_stream_name.as_deref(),
+            Some("security-events")
+        );
+    }
+
+    #[test]
+    fn invalid_security_events_stream_name_is_a_typed_error_without_the_value() {
+        let too_long = "a".repeat(129);
+        for invalid in ["has space", "semi;colon", "ñandú", too_long.as_str()] {
+            let mut env = FakeEnv::valid();
+            env.set(SECURITY_EVENTS_STREAM_NAME_VAR, invalid);
+            let err = env.load().expect_err("nombre inválido");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidStreamName { variable }
+                        if variable == SECURITY_EVENTS_STREAM_NAME_VAR
+                ),
+                "esperaba InvalidStreamName para {invalid:?}, obtuve {err:?}"
+            );
+            assert!(!err.to_string().contains(invalid), "{err}");
+        }
+    }
+
+    #[test]
+    fn aws_region_and_endpoint_are_optional_trimmed_and_blank_means_unset() {
+        let config = FakeEnv::valid().load().expect("config válida");
+        assert_eq!(config.aws_region, None);
+        assert_eq!(config.aws_endpoint_url, None);
+
+        let mut env = FakeEnv::valid();
+        env.set(AWS_REGION_VAR, " us-east-1 ");
+        env.set(AWS_ENDPOINT_URL_VAR, " http://localstack:4566 ");
+        let config = env.load().expect("config válida");
+        assert_eq!(config.aws_region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            config.aws_endpoint_url.as_deref(),
+            Some("http://localstack:4566")
+        );
+
+        let mut env = FakeEnv::valid();
+        env.set(AWS_REGION_VAR, "  ");
+        env.set(AWS_ENDPOINT_URL_VAR, "");
+        let config = env.load().expect("config válida");
+        assert_eq!(config.aws_region, None);
+        assert_eq!(config.aws_endpoint_url, None);
     }
 }

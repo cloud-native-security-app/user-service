@@ -27,6 +27,7 @@
 //! testearlas sin Docker.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -40,6 +41,7 @@ use crate::domain::{
     AdminEmails, AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry,
     ScanStatus, StoredScanResult, UserProfile,
 };
+use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 
 /// Longitud del nonce de AES-256-GCM (96 bits, el tamaño que exige la
 /// construcción `Aes256Gcm`).
@@ -54,6 +56,7 @@ pub struct Repository {
     pool: PgPool,
     encryption_key: SecretSlice<u8>,
     admin_emails: AdminEmails,
+    security_events: Arc<dyn SecurityEventPublisher>,
 }
 
 impl Repository {
@@ -65,6 +68,7 @@ impl Repository {
             pool,
             encryption_key,
             admin_emails: AdminEmails::default(),
+            security_events: Arc::new(NoopSecurityEventPublisher),
         }
     }
 
@@ -74,6 +78,17 @@ impl Repository {
     /// administrador.
     pub fn with_admin_emails(mut self, admin_emails: AdminEmails) -> Self {
         self.admin_emails = admin_emails;
+        self
+    }
+
+    /// Fija el destino de los eventos `audit.recorded` que emite el
+    /// repositorio al confirmar cada entrada de auditoría. Sin él (por
+    /// defecto) se descartan (adaptador no-op).
+    pub fn with_security_events(
+        mut self,
+        security_events: Arc<dyn SecurityEventPublisher>,
+    ) -> Self {
+        self.security_events = security_events;
         self
     }
 
