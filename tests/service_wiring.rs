@@ -72,6 +72,16 @@ struct RunningService {
 /// la [`Config`] de dos pools y ensambla + sirve el servicio real de
 /// `service_wiring` en un puerto efímero de loopback.
 async fn start_running_service() -> RunningService {
+    start_running_service_with("", &[]).await
+}
+
+/// Igual que [`start_running_service`], con `ADMIN_BOOTSTRAP_EMAILS` y
+/// usuarios (`user_id`, `email`) ya existentes antes de arrancar, para
+/// verificar la reconciliación de roles durante el arranque.
+async fn start_running_service_with(
+    admin_emails: &str,
+    existing_users: &[(&str, &str)],
+) -> RunningService {
     let container = PostgresImage::default()
         .start()
         .await
@@ -107,6 +117,15 @@ async fn start_running_service() -> RunningService {
     .await
     .expect("debe poder activarse el login del rol de aplicación para el test");
 
+    for (user_id, email) in existing_users {
+        sqlx::query("INSERT INTO users (user_id, email, display_name) VALUES ($1, $2, 'Seed')")
+            .bind(user_id)
+            .bind(email)
+            .execute(&superuser_pool)
+            .await
+            .expect("el usuario previo debe insertarse");
+    }
+
     superuser_pool.close().await;
 
     let app_url = format!("postgres://ms_usuarios_app:{app_password}@{host}:{port}/postgres");
@@ -118,6 +137,8 @@ async fn start_running_service() -> RunningService {
         gateway_shared_secret: SecretString::from(TEST_GATEWAY_SECRET.to_string()),
         credentials_encryption_key: SecretSlice::from(vec![0x07u8; 32]),
         migrations_database_url: superuser_url,
+        admin_bootstrap_emails: user_service::domain::AdminEmails::parse(admin_emails)
+            .expect("lista de administradores válida"),
     };
 
     let app = wiring::build_router(&config)
@@ -264,4 +285,35 @@ async fn full_flow_create_profile_scan_history_and_audit_over_real_http() {
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0]["user_id"], user_id);
     assert_eq!(audit[0]["target"], "192.0.2.100");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn startup_reconciles_existing_users_with_admin_bootstrap_emails() {
+    let service = start_running_service_with(
+        "Seed-Admin@Example.test",
+        &[
+            ("seed-admin", "seed-admin@example.test"),
+            ("seed-regular", "seed-regular@example.test"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    for (user_id, email, expected_role) in [
+        ("seed-admin", "seed-admin@example.test", "admin"),
+        ("seed-regular", "seed-regular@example.test", "user"),
+    ] {
+        let profile: Value = client
+            .get(format!("{}/users/me", service.base_url))
+            .header(GATEWAY_SECRET_HEADER, TEST_GATEWAY_SECRET)
+            .header(FORWARDED_USER_HEADER, identity_header(user_id, email))
+            .send()
+            .await
+            .expect("GET /users/me")
+            .json()
+            .await
+            .expect("JSON");
+        assert_eq!(profile["role"], expected_role, "{user_id}");
+    }
 }

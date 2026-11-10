@@ -35,9 +35,10 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::PgPool;
 
+use crate::audit::{ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION};
 use crate::domain::{
-    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus,
-    StoredScanResult, UserProfile,
+    AdminEmails, AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry,
+    ScanStatus, StoredScanResult, UserProfile,
 };
 
 /// Longitud del nonce de AES-256-GCM (96 bits, el tamaño que exige la
@@ -52,6 +53,7 @@ const AES_GCM_NONCE_LEN: usize = 12;
 pub struct Repository {
     pool: PgPool,
     encryption_key: SecretSlice<u8>,
+    admin_emails: AdminEmails,
 }
 
 impl Repository {
@@ -62,12 +64,93 @@ impl Repository {
         Self {
             pool,
             encryption_key,
+            admin_emails: AdminEmails::default(),
         }
+    }
+
+    /// Fija la lista autoritativa de administradores
+    /// (`ADMIN_BOOTSTRAP_EMAILS`) que usan [`Repository::sync_admin_roles`] y
+    /// [`Repository::reconcile_user_role`]. Sin ella (por defecto) nadie es
+    /// administrador.
+    pub fn with_admin_emails(mut self, admin_emails: AdminEmails) -> Self {
+        self.admin_emails = admin_emails;
+        self
+    }
+
+    /// Reconcilia el rol de **todos** los usuarios con la lista de
+    /// administradores: concede `admin` a los listados y revoca a los que ya
+    /// no lo están. Idempotente: solo toca (y audita) las filas cuyo rol
+    /// cambia. Devuelve cuántos roles cambiaron.
+    ///
+    /// # Errores
+    ///
+    /// [`RepoError`] si la consulta o la auditoría fallan; en ese caso no se
+    /// confirma ningún cambio.
+    pub async fn sync_admin_roles(&self) -> Result<u64, RepoError> {
+        self.reconcile_roles(None).await
+    }
+
+    /// Igual que [`Repository::sync_admin_roles`], limitado a `user_id`:
+    /// se usa al aprovisionar el perfil para que un usuario listado que inicia
+    /// sesión por primera vez sea administrador de inmediato.
+    ///
+    /// # Errores
+    ///
+    /// Ver [`Repository::sync_admin_roles`].
+    pub async fn reconcile_user_role(&self, user_id: &str) -> Result<(), RepoError> {
+        self.reconcile_roles(Some(user_id)).await.map(|_| ())
+    }
+
+    /// Cambia el rol de los usuarios cuyo rol no coincide con la lista y
+    /// escribe una entrada `role.granted`/`role.revoked` por cada cambio, en
+    /// la misma transacción. La entrada no incluye el correo: `target` es el
+    /// rol resultante.
+    async fn reconcile_roles(&self, only_user: Option<&str>) -> Result<u64, RepoError> {
+        let admins = self.admin_emails.to_lowercase_vec();
+        let mut tx = self.pool.begin().await?;
+
+        let changed: Vec<(String, String)> = sqlx::query_as(
+            "UPDATE users SET role = CASE WHEN lower(email) = ANY($1) THEN 'admin' ELSE 'user' END \
+             WHERE ($2::text IS NULL OR user_id = $2) \
+             AND role <> CASE WHEN lower(email) = ANY($1) THEN 'admin' ELSE 'user' END \
+             RETURNING user_id, role",
+        )
+        .bind(&admins)
+        .bind(only_user)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (user_id, role) in &changed {
+            let action = if role == Role::Admin.as_str() {
+                ROLE_GRANTED_ACTION
+            } else {
+                ROLE_REVOKED_ACTION
+            };
+            sqlx::query(
+                "INSERT INTO audit_log (id, user_id, target, action, recorded_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(user_id)
+            .bind(role)
+            .bind(action)
+            .bind(chrono::Utc::now())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(changed.len() as u64)
     }
 
     /// Crea el perfil de `profile.user_id` si no existe, o actualiza
     /// `email`/`display_name` si ya existía (`created_at` del registro
     /// original se conserva).
+    ///
+    /// Nunca escribe `role`: un perfil nuevo toma el valor por defecto
+    /// (`user`) y uno existente conserva el suyo, sea cual sea
+    /// `profile.role`. El rol solo cambia vía la reconciliación con
+    /// `ADMIN_BOOTSTRAP_EMAILS`.
     ///
     /// # Errores
     ///
@@ -99,13 +182,13 @@ impl Repository {
     /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
     pub async fn find_user(&self, user_id: &str) -> Result<Option<UserProfile>, RepoError> {
         let row = sqlx::query_as::<_, UserRow>(
-            "SELECT user_id, email, display_name, created_at FROM users WHERE user_id = $1",
+            "SELECT user_id, email, display_name, role, created_at FROM users WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(UserProfile::from))
+        row.map(UserProfile::try_from).transpose()
     }
 
     /// Inserta una nueva entrada de histórico de escaneo (RF-13).
@@ -548,23 +631,29 @@ impl Repository {
     }
 }
 
-/// Fila cruda de la tabla `users`, mapeada a [`UserProfile`] vía `From`.
+/// Fila cruda de la tabla `users`, mapeada a [`UserProfile`] vía `TryFrom`.
 #[derive(sqlx::FromRow)]
 struct UserRow {
     user_id: String,
     email: String,
     display_name: String,
+    role: String,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<UserRow> for UserProfile {
-    fn from(row: UserRow) -> Self {
-        UserProfile {
+impl TryFrom<UserRow> for UserProfile {
+    type Error = RepoError;
+
+    /// Falla con [`RepoError::Backend`] si `role` no es un rol conocido
+    /// (la restricción `CHECK` ya lo impide; se maneja como error tipado).
+    fn try_from(row: UserRow) -> Result<Self, Self::Error> {
+        Ok(UserProfile {
             user_id: row.user_id,
             email: row.email,
             display_name: row.display_name,
+            role: Role::from_db_str(&row.role).ok_or(RepoError::Backend)?,
             created_at: row.created_at,
-        }
+        })
     }
 }
 

@@ -24,6 +24,12 @@ Migraciones versionadas de `sqlx migrate` para `db-usuarios` (feature
   `scan_history` gana `result JSONB NULL` y `failure_reason TEXT NULL`, y la
   restricción `CHECK` de `status` admite `CANCELADO`. Aditiva y
   retrocompatible.
+- `20261109120000_add_user_role.sql`: feature `user-role` (KAP-04); `users`
+  gana `role TEXT NOT NULL DEFAULT 'user'` con `CHECK (role IN ('user',
+  'admin'))`. Aditiva: las filas existentes quedan como `user`. No concede
+  permisos nuevos (`ms_usuarios_app` ya tiene `SELECT/INSERT/UPDATE` sobre
+  `users`); ninguna petición HTTP escribe `role`, solo la reconciliación con
+  `ADMIN_BOOTSTRAP_EMAILS`.
 
 Recordatorio de convención (ver `docs/conventions.md`): una vez aplicada una
 migración en algún entorno, nunca se edita — un cambio de esquema es una

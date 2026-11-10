@@ -82,7 +82,8 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::domain::{
-    AuditEntry, NetworkCredential, ResolvedScanTarget, ScanHistoryEntry, ScanStatus, UserProfile,
+    AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry, ScanStatus,
+    UserProfile,
 };
 use crate::repository::{parse_target, RepoError, Repository};
 
@@ -258,12 +259,23 @@ async fn put_profile(
         user_id: identity.sub,
         email: identity.email,
         display_name: payload.display_name,
+        // Solo marcador: `upsert_user` nunca persiste este valor y la
+        // respuesta se relee de la base de datos.
+        role: Role::User,
         created_at: Utc::now(),
     };
 
     state
         .repository
         .upsert_user(&profile)
+        .await
+        .map_err(ApiError::from)?;
+
+    // La lista `ADMIN_BOOTSTRAP_EMAILS` decide el rol (concede o revoca) con
+    // el correo verificado por el Gateway; el cuerpo nunca interviene.
+    state
+        .repository
+        .reconcile_user_role(&profile.user_id)
         .await
         .map_err(ApiError::from)?;
 

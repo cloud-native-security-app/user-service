@@ -27,7 +27,7 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 use user_service::domain::{
-    AuditEntry, ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
+    AdminEmails, AuditEntry, Role, ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
 };
 use user_service::repository::{parse_target, RepoError, Repository};
 use uuid::Uuid;
@@ -123,6 +123,7 @@ fn sample_profile(user_id: &str) -> UserProfile {
         user_id: user_id.to_string(),
         email: format!("{user_id}@example.test"),
         display_name: "Test User".to_string(),
+        role: Role::User,
         created_at: now_with_db_precision(),
     }
 }
@@ -1158,4 +1159,190 @@ async fn upsert_network_credential_for_an_unknown_user_fails_with_a_constraint_e
         matches!(result, Err(RepoError::Constraint(_))),
         "la FK user_id debe rechazar credenciales para usuarios inexistentes: {result:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn find_user_returns_the_default_user_role_for_a_new_profile() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+
+    repo.upsert_user(&sample_profile("role-default"))
+        .await
+        .expect("upsert");
+    let found = repo
+        .find_user("role-default")
+        .await
+        .expect("find")
+        .expect("existe");
+
+    assert_eq!(found.role, Role::User);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn upsert_user_never_persists_the_role_carried_by_the_profile() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let mut profile = sample_profile("role-escalation");
+    profile.role = Role::Admin;
+
+    repo.upsert_user(&profile).await.expect("insert");
+    repo.upsert_user(&profile).await.expect("update");
+    let found = repo
+        .find_user("role-escalation")
+        .await
+        .expect("find")
+        .expect("existe");
+
+    assert_eq!(found.role, Role::User);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn database_rejects_a_role_outside_user_and_admin() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    repo.upsert_user(&sample_profile("role-check"))
+        .await
+        .expect("upsert");
+
+    let result = sqlx::query("UPDATE users SET role = 'root' WHERE user_id = 'role-check'")
+        .execute(&db.app_pool)
+        .await;
+
+    let error = result.expect_err("el CHECK debe rechazar roles desconocidos");
+    let code = error
+        .as_database_error()
+        .and_then(|db_error| db_error.code().map(|code| code.to_string()));
+    assert_eq!(code.as_deref(), Some("23514"), "check_violation");
+}
+
+fn repo_with_admins(db: &TestDb, emails: &str) -> Repository {
+    Repository::new(db.app_pool.clone(), test_encryption_key())
+        .with_admin_emails(AdminEmails::parse(emails).expect("lista válida"))
+}
+
+async fn role_actions(repo: &Repository, user_id: &str) -> Vec<(String, String)> {
+    repo.list_audit_entries(user_id)
+        .await
+        .expect("auditoría")
+        .into_iter()
+        .filter(|entry| entry.action().starts_with("role."))
+        .map(|entry| (entry.action().to_string(), entry.target().to_string()))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn sync_admin_roles_grants_listed_users_case_insensitively_and_audits_it() {
+    let db = start_test_db().await;
+    let plain = Repository::new(db.app_pool.clone(), test_encryption_key());
+    plain
+        .upsert_user(&sample_profile("sync-admin"))
+        .await
+        .expect("upsert");
+    plain
+        .upsert_user(&sample_profile("sync-regular"))
+        .await
+        .expect("upsert");
+    let repo = repo_with_admins(&db, "SYNC-ADMIN@Example.test");
+
+    let changed = repo.sync_admin_roles().await.expect("sync");
+
+    assert_eq!(changed, 1);
+    let admin = repo.find_user("sync-admin").await.unwrap().unwrap();
+    let regular = repo.find_user("sync-regular").await.unwrap().unwrap();
+    assert_eq!(admin.role, Role::Admin);
+    assert_eq!(regular.role, Role::User);
+    assert_eq!(
+        role_actions(&repo, "sync-admin").await,
+        vec![("role.granted".to_string(), "admin".to_string())]
+    );
+    assert!(role_actions(&repo, "sync-regular").await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn sync_admin_roles_is_idempotent_and_does_not_repeat_audit_entries() {
+    let db = start_test_db().await;
+    let repo = repo_with_admins(&db, "sync-twice@example.test");
+    repo.upsert_user(&sample_profile("sync-twice"))
+        .await
+        .expect("upsert");
+
+    assert_eq!(repo.sync_admin_roles().await.unwrap(), 1);
+    assert_eq!(repo.sync_admin_roles().await.unwrap(), 0);
+
+    assert_eq!(role_actions(&repo, "sync-twice").await.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn sync_admin_roles_revokes_admins_that_left_the_list_and_audits_it() {
+    let db = start_test_db().await;
+    let granting = repo_with_admins(&db, "sync-revoked@example.test");
+    granting
+        .upsert_user(&sample_profile("sync-revoked"))
+        .await
+        .expect("upsert");
+    granting.sync_admin_roles().await.expect("grant");
+    let revoking = repo_with_admins(&db, "");
+
+    let changed = revoking.sync_admin_roles().await.expect("revoke");
+
+    assert_eq!(changed, 1);
+    let found = revoking.find_user("sync-revoked").await.unwrap().unwrap();
+    assert_eq!(found.role, Role::User);
+    assert_eq!(
+        role_actions(&revoking, "sync-revoked").await,
+        vec![
+            ("role.granted".to_string(), "admin".to_string()),
+            ("role.revoked".to_string(), "user".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn reconcile_user_role_only_touches_the_given_user() {
+    let db = start_test_db().await;
+    let plain = Repository::new(db.app_pool.clone(), test_encryption_key());
+    plain
+        .upsert_user(&sample_profile("rec-target"))
+        .await
+        .expect("upsert");
+    plain
+        .upsert_user(&sample_profile("rec-other"))
+        .await
+        .expect("upsert");
+    let repo = repo_with_admins(&db, "rec-target@example.test,rec-other@example.test");
+
+    repo.reconcile_user_role("rec-target").await.expect("rec");
+
+    assert_eq!(
+        repo.find_user("rec-target").await.unwrap().unwrap().role,
+        Role::Admin
+    );
+    assert_eq!(
+        repo.find_user("rec-other").await.unwrap().unwrap().role,
+        Role::User
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn audit_log_stays_append_only_for_role_entries() {
+    let db = start_test_db().await;
+    let repo = repo_with_admins(&db, "audit-role@example.test");
+    repo.upsert_user(&sample_profile("audit-role"))
+        .await
+        .expect("upsert");
+    repo.sync_admin_roles().await.expect("sync");
+
+    let update = sqlx::query("UPDATE audit_log SET action = 'x' WHERE user_id = 'audit-role'")
+        .execute(&db.app_pool)
+        .await;
+
+    assert!(update.is_err());
 }
