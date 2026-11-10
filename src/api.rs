@@ -81,6 +81,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::audit::SCAN_REQUESTED_ACTION;
 use crate::domain::{
     AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry, ScanStatus,
     UserProfile,
@@ -93,10 +94,6 @@ const MAX_FAILURE_REASON_CHARS: usize = 500;
 /// Tamaño máximo (en bytes del JSON serializado) de `result`: el límite de
 /// un mensaje SNS/SQS.
 const MAX_RESULT_BYTES: usize = 256 * 1024;
-
-/// Acción de auditoría registrada por [`create_scan`] junto con cada nueva
-/// entrada de histórico (RF-15).
-const SCAN_REQUESTED_ACTION: &str = "scan_requested";
 
 /// Nombre del header con la credencial de servicio compartida
 /// Gateway↔`ms-usuarios` (ver `docs/security-scope.md`).

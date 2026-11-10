@@ -22,6 +22,7 @@
 //! puede omitirse por completo, ver `src/config.rs`); en producción el
 //! operador las separa.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -33,7 +34,9 @@ use sqlx::PgPool;
 
 use crate::api;
 use crate::config::Config;
+use crate::messaging::kinesis::KinesisSecurityEventPublisher;
 use crate::repository::Repository;
+use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 
 /// Tiempo máximo de espera para establecer una conexión con PostgreSQL al
 /// arrancar (pool de migraciones y pool de aplicación).
@@ -80,7 +83,8 @@ async fn build_router_with_connect_timeout(
 
     let health_pool = database_pool.clone();
     let repository = Repository::new(database_pool, config.credentials_encryption_key.clone())
-        .with_admin_emails(config.admin_bootstrap_emails.clone());
+        .with_admin_emails(config.admin_bootstrap_emails.clone())
+        .with_security_events(build_security_event_publisher(config).await);
 
     // La lista es autoritativa: concede y revoca el rol de los usuarios que ya
     // existen antes de servir tráfico (idempotente).
@@ -97,6 +101,32 @@ async fn build_router_with_connect_timeout(
         .with_state(health_pool);
 
     Ok(health_router.merge(api_router))
+}
+
+/// Elige el adaptador de eventos de seguridad según la configuración: Kinesis
+/// si `SECURITY_EVENTS_STREAM_NAME` está definida, si no el no-op (con un
+/// único log informativo al arrancar). No abre conexiones: un Kinesis
+/// inalcanzable solo se nota al publicar y nunca impide arrancar.
+async fn build_security_event_publisher(config: &Config) -> Arc<dyn SecurityEventPublisher> {
+    match &config.security_events_stream_name {
+        Some(stream_name) => {
+            tracing::info!(stream = %stream_name, "eventos de seguridad: publicando en Kinesis");
+            Arc::new(
+                KinesisSecurityEventPublisher::connect(
+                    config.aws_region.as_deref(),
+                    config.aws_endpoint_url.as_deref(),
+                    stream_name.clone(),
+                )
+                .await,
+            )
+        }
+        None => {
+            tracing::info!(
+                "eventos de seguridad desactivados: SECURITY_EVENTS_STREAM_NAME no está definida"
+            );
+            Arc::new(NoopSecurityEventPublisher)
+        }
+    }
 }
 
 /// Conecta con `migrations_database_url` y aplica las migraciones
@@ -190,6 +220,9 @@ mod tests {
             credentials_encryption_key: SecretBox::from(vec![0x07u8; 32].into_boxed_slice()),
             migrations_database_url: UNREACHABLE_URL.to_string(),
             admin_bootstrap_emails: Default::default(),
+            security_events_stream_name: None,
+            aws_region: None,
+            aws_endpoint_url: None,
         };
 
         // Cota de seguridad ante cuelgues: con `acquire_timeout` de 1 s el

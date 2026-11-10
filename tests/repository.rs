@@ -19,6 +19,8 @@
 //!   tests reflejen exactamente los permisos con los que corre el
 //!   repositorio en producción.
 
+use std::sync::Arc;
+
 use secrecy::SecretSlice;
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::{Error as SqlxError, PgPool, Row};
@@ -30,6 +32,9 @@ use user_service::domain::{
     AdminEmails, AuditEntry, Role, ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
 };
 use user_service::repository::{parse_target, RepoError, Repository};
+use user_service::security_events::{
+    RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError, SecurityEventPublisher,
+};
 use uuid::Uuid;
 
 /// Clave de cifrado de laboratorio (32 bytes, `0x07`) para los tests — el
@@ -1345,4 +1350,244 @@ async fn audit_log_stays_append_only_for_role_entries() {
         .await;
 
     assert!(update.is_err());
+}
+
+// --- KAP-08: eventos `audit.recorded` tras confirmar cada entrada ---
+
+/// Repositorio que publica en un grabador en memoria.
+fn repo_with_recorder(db: &TestDb) -> (Repository, Arc<RecordingSecurityEventPublisher>) {
+    let recorder = Arc::new(RecordingSecurityEventPublisher::new());
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key())
+        .with_security_events(recorder.clone());
+    (repo, recorder)
+}
+
+/// Publicador que siempre falla (Kinesis caído).
+struct FailingPublisher;
+
+#[async_trait::async_trait]
+impl SecurityEventPublisher for FailingPublisher {
+    async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+        Err(SecurityEventError::PublishFailed("kinesis caído".into()))
+    }
+}
+
+/// Cede el turno varias veces: da a la tarea de emisión la oportunidad de
+/// correr (sin esperas de reloj) antes de afirmar que no publicó nada.
+async fn let_background_tasks_run() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn actions_of(events: &[SecurityEvent]) -> Vec<(String, String, String)> {
+    events
+        .iter()
+        .map(|event| {
+            (
+                event.actor_sub().expect("actor_sub").to_string(),
+                event.payload()["action"].as_str().unwrap().to_string(),
+                event.payload()["resource_type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn record_scan_request_emits_scan_requested_for_the_requester_after_commit() {
+    let db = start_test_db().await;
+    let (repo, recorder) = repo_with_recorder(&db);
+    let profile = sample_profile("event-user-1");
+    repo.upsert_user(&profile).await.expect("upsert");
+    let entry = sample_scan("event-scan-1", &profile.user_id, ScanStatus::Pendiente);
+    let audit_entry = AuditEntry::new(
+        "event-audit-1",
+        &profile.user_id,
+        &entry.target,
+        "scan_requested",
+        entry.requested_at,
+    );
+
+    repo.record_scan_request(&entry, &audit_entry)
+        .await
+        .expect("record_scan_request");
+
+    let events = recorder.wait_for(1).await;
+    assert_eq!(
+        actions_of(&events),
+        [(
+            "event-user-1".to_string(),
+            "scan.requested".to_string(),
+            "scan".to_string()
+        )]
+    );
+    // La entrada ya está confirmada cuando el evento sale.
+    assert_eq!(
+        repo.list_audit_entries("event-user-1").await.unwrap().len(),
+        1
+    );
+    let body = serde_json::to_string(&events[0]).unwrap();
+    assert!(
+        !body.contains(&entry.target),
+        "el evento no lleva el objetivo"
+    );
+    assert!(
+        !body.contains("example.test"),
+        "el evento no lleva el correo"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_rolled_back_scan_request_emits_no_event() {
+    let db = start_test_db().await;
+    let (repo, recorder) = repo_with_recorder(&db);
+    let profile = sample_profile("event-user-2");
+    repo.upsert_user(&profile).await.expect("upsert");
+    let entry = sample_scan("event-scan-2", &profile.user_id, ScanStatus::Pendiente);
+    // `user_id` inexistente: la FK de audit_log falla y la transacción se revierte.
+    let audit_entry = AuditEntry::new(
+        "event-audit-2",
+        "no-existe-como-usuario",
+        &entry.target,
+        "scan_requested",
+        entry.requested_at,
+    );
+
+    let result = repo.record_scan_request(&entry, &audit_entry).await;
+
+    assert!(result.is_err());
+    let_background_tasks_run().await;
+    assert!(
+        recorder.events().is_empty(),
+        "no se emite nada tras un rollback"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn append_audit_entry_emits_once_for_a_mapped_action_and_never_for_an_unmapped_one() {
+    let db = start_test_db().await;
+    let (repo, recorder) = repo_with_recorder(&db);
+    let profile = sample_profile("event-user-3");
+    repo.upsert_user(&profile).await.expect("upsert");
+    let at = now_with_db_precision();
+
+    repo.append_audit_entry(&AuditEntry::new(
+        "event-audit-3a",
+        &profile.user_id,
+        "192.0.2.1",
+        "free text with secrets",
+        at,
+    ))
+    .await
+    .expect("append");
+    repo.append_audit_entry(&AuditEntry::new(
+        "event-audit-3b",
+        &profile.user_id,
+        "192.0.2.1",
+        "scan_requested",
+        at,
+    ))
+    .await
+    .expect("append");
+
+    let events = recorder.wait_for(1).await;
+    let_background_tasks_run().await;
+    assert_eq!(recorder.events().len(), 1, "solo la acción con mapeo emite");
+    assert_eq!(actions_of(&events)[0].1, "scan.requested");
+    // Ambas filas se escribieron: el mapeo no afecta a la auditoría.
+    assert_eq!(
+        repo.list_audit_entries("event-user-3").await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn role_reconciliation_emits_one_event_per_change_and_none_when_idempotent() {
+    let db = start_test_db().await;
+    let plain = Repository::new(db.app_pool.clone(), test_encryption_key());
+    plain
+        .upsert_user(&sample_profile("event-admin"))
+        .await
+        .expect("upsert");
+    plain
+        .upsert_user(&sample_profile("event-regular"))
+        .await
+        .expect("upsert");
+    let recorder = Arc::new(RecordingSecurityEventPublisher::new());
+    let granting =
+        repo_with_admins(&db, "event-admin@example.test").with_security_events(recorder.clone());
+
+    assert_eq!(granting.sync_admin_roles().await.unwrap(), 1);
+    assert_eq!(granting.sync_admin_roles().await.unwrap(), 0);
+    let revoking = repo_with_admins(&db, "").with_security_events(recorder.clone());
+    assert_eq!(revoking.sync_admin_roles().await.unwrap(), 1);
+
+    let events = recorder.wait_for(2).await;
+    let_background_tasks_run().await;
+    assert_eq!(
+        actions_of(&recorder.events()),
+        [
+            (
+                "event-admin".to_string(),
+                "role.granted".to_string(),
+                "user".to_string()
+            ),
+            (
+                "event-admin".to_string(),
+                "role.revoked".to_string(),
+                "user".to_string()
+            ),
+        ]
+    );
+    assert_eq!(events.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_failing_publisher_changes_neither_the_result_nor_the_audit_rows() {
+    let db = start_test_db().await;
+    let repo = repo_with_admins(&db, "event-failing@example.test")
+        .with_security_events(Arc::new(FailingPublisher));
+    let profile = sample_profile("event-failing");
+    repo.upsert_user(&profile).await.expect("upsert");
+
+    assert_eq!(repo.sync_admin_roles().await.expect("sync no falla"), 1);
+    let entry = sample_scan("event-scan-4", &profile.user_id, ScanStatus::Pendiente);
+    let audit_entry = AuditEntry::new(
+        "event-audit-4",
+        &profile.user_id,
+        &entry.target,
+        "scan_requested",
+        entry.requested_at,
+    );
+    repo.record_scan_request(&entry, &audit_entry)
+        .await
+        .expect("record_scan_request no falla");
+    repo.append_audit_entry(&AuditEntry::new(
+        "event-audit-4b",
+        &profile.user_id,
+        "192.0.2.1",
+        "scan_requested",
+        entry.requested_at,
+    ))
+    .await
+    .expect("append no falla");
+    let_background_tasks_run().await;
+
+    let audit = repo.list_audit_entries(&profile.user_id).await.unwrap();
+    assert_eq!(audit.len(), 3, "role.granted + 2 scan_requested");
+    assert_eq!(
+        repo.list_scan_history(&profile.user_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
