@@ -79,6 +79,7 @@ Give each user a `role` (`user` or `admin`), expose it in the profile response t
 - Observed once: `cargo test --lib` reported `57 passed; 1 failed` right after the feature landed; the failing test name was not captured. Not reproduced in 26 later runs (7 sequential, 18 in parallel batches of 6, plus each test run alone).
 - Suspect 1: `wiring::tests::build_router_returns_typed_error_when_migrations_database_is_unreachable` takes 30 s on every run because `migrate()` connects without `acquire_timeout`, so it relies on the sqlx default 30 s connect retry loop. Pre-existing (not introduced by KAP-04) and timing-dependent.
 - Suspect 2: `config` tests mutate the process environment with `unsafe` `set_var`/`remove_var`. `ENV_MUTEX` serializes them against each other, but not against other tests in the same binary that may read the environment through C code (sqlx connection options, DNS resolution). KAP-04 added five more such tests, which raises the odds of a rare interleaving.
+- Resolved in `odd/tasks/flaky-unit-tests.md` (branch `fix/flaky_unit_tests`).
 - Proposed fix (separate branch): give `migrate()` a short configurable `acquire_timeout`, and make `Config` loading testable without touching the global environment (a lookup function injected into `from_env`), so no test mutates the process env.
 
 ## Next step

@@ -7,6 +7,7 @@
 //! en el código. [`Config::from_env`] nunca hace `panic!`: cualquier
 //! variable ausente o inválida se traduce en un [`ConfigError`] tipado.
 
+use std::ffi::OsString;
 use std::fmt;
 
 use secrecy::{SecretBox, SecretSlice, SecretString};
@@ -127,15 +128,35 @@ impl Config {
     /// si `CREDENTIALS_ENCRYPTION_KEY` no decodifica a 32 bytes de hex.
     /// Nunca hace `panic!`.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let database_url = read_required(DATABASE_URL_VAR)?;
-        let http_host = read_required(HTTP_HOST_VAR)?;
-        let raw_http_port = read_required(HTTP_PORT_VAR)?;
-        let gateway_shared_secret = SecretString::from(read_required(GATEWAY_SHARED_SECRET_VAR)?);
+        Self::from_lookup(|name| std::env::var_os(name))
+    }
+
+    /// Carga la configuración consultando cada variable mediante `lookup`
+    /// (nombre de variable → valor, o `None` si está ausente).
+    ///
+    /// Es la lógica pura detrás de [`Config::from_env`]: no toca el entorno
+    /// del proceso, por lo que los tests la ejercitan con un mapa en memoria
+    /// sin mutar estado global. Mismas variables, valores por defecto y
+    /// errores que `from_env`.
+    ///
+    /// # Errores
+    ///
+    /// Los mismos que [`Config::from_env`].
+    pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let database_url = read_required(&lookup, DATABASE_URL_VAR)?;
+        let http_host = read_required(&lookup, HTTP_HOST_VAR)?;
+        let raw_http_port = read_required(&lookup, HTTP_PORT_VAR)?;
+        let gateway_shared_secret =
+            SecretString::from(read_required(&lookup, GATEWAY_SHARED_SECRET_VAR)?);
         let credentials_encryption_key =
-            decode_encryption_key(&read_required(CREDENTIALS_ENCRYPTION_KEY_VAR)?)?;
-        let admin_bootstrap_emails = read_admin_emails()?;
-        let migrations_database_url =
-            std::env::var(MIGRATIONS_DATABASE_URL_VAR).unwrap_or_else(|_| database_url.clone());
+            decode_encryption_key(&read_required(&lookup, CREDENTIALS_ENCRYPTION_KEY_VAR)?)?;
+        let admin_bootstrap_emails = read_admin_emails(&lookup)?;
+        let migrations_database_url = lookup(MIGRATIONS_DATABASE_URL_VAR)
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| database_url.clone());
 
         let http_port = raw_http_port
             .parse::<u16>()
@@ -179,14 +200,15 @@ fn decode_encryption_key(value: &str) -> Result<SecretSlice<u8>, ConfigError> {
 /// Lee `ADMIN_BOOTSTRAP_EMAILS`: ausente = sin administradores. Un valor que
 /// no es UTF-8 válido o con una entrada que no es un correo falla (cierra en
 /// vez de interpretar mal la lista).
-fn read_admin_emails() -> Result<AdminEmails, ConfigError> {
+fn read_admin_emails(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+) -> Result<AdminEmails, ConfigError> {
     let invalid = || ConfigError::InvalidAdminEmails {
         variable: ADMIN_BOOTSTRAP_EMAILS_VAR,
     };
-    let raw = match std::env::var(ADMIN_BOOTSTRAP_EMAILS_VAR) {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => String::new(),
-        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    let raw = match lookup(ADMIN_BOOTSTRAP_EMAILS_VAR) {
+        Some(value) => value.into_string().map_err(|_| invalid())?,
+        None => String::new(),
     };
     AdminEmails::parse(&raw).map_err(|_| invalid())
 }
@@ -194,8 +216,13 @@ fn read_admin_emails() -> Result<AdminEmails, ConfigError> {
 /// Lee una variable de entorno requerida, devolviendo un
 /// [`ConfigError::MissingVar`] tipado (nunca un panic) si está ausente o no
 /// es UTF-8 válido.
-fn read_required(variable: &'static str) -> Result<String, ConfigError> {
-    std::env::var(variable).map_err(|_| ConfigError::MissingVar { variable })
+fn read_required(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+    variable: &'static str,
+) -> Result<String, ConfigError> {
+    lookup(variable)
+        .and_then(|value| value.into_string().ok())
+        .ok_or(ConfigError::MissingVar { variable })
 }
 
 /// Error devuelto por [`Config::from_env`] cuando la configuración no puede
@@ -239,15 +266,12 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
     use secrecy::ExposeSecret;
 
     use super::*;
-
-    /// Garantiza aislamiento entre tests: `std::env::set_var`/`remove_var`
-    /// operan sobre el entorno global del proceso, así que los tests que
-    /// tocan variables de entorno se serializan con un mutex para evitar
-    /// condiciones de carrera entre hilos de test.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const SECRET_VALUE: &str = "top-secret-gateway-credential";
 
@@ -258,52 +282,40 @@ mod tests {
         HEX
     }
 
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
+    /// Entorno en memoria: sustituye al entorno global del proceso, de modo
+    /// que los tests no mutan estado compartido ni dependen de las variables
+    /// de la shell de quien los ejecuta.
+    struct FakeEnv(HashMap<&'static str, OsString>);
 
-    impl EnvGuard {
-        fn set_valid_env() -> Self {
-            let lock = ENV_MUTEX
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Seguro: los tests de este módulo son la única fuente que muta
-            // estas variables, y `ENV_MUTEX` serializa el acceso.
-            unsafe {
-                std::env::set_var(DATABASE_URL_VAR, "postgres://user:pass@localhost/db");
-                std::env::set_var(HTTP_HOST_VAR, "0.0.0.0");
-                std::env::set_var(HTTP_PORT_VAR, "8080");
-                std::env::set_var(GATEWAY_SHARED_SECRET_VAR, SECRET_VALUE);
-                std::env::set_var(CREDENTIALS_ENCRYPTION_KEY_VAR, encryption_key_hex());
-            }
-            EnvGuard { _lock: lock }
+    impl FakeEnv {
+        fn valid() -> Self {
+            let mut env = FakeEnv(HashMap::new());
+            env.set(DATABASE_URL_VAR, "postgres://user:pass@localhost/db");
+            env.set(HTTP_HOST_VAR, "0.0.0.0");
+            env.set(HTTP_PORT_VAR, "8080");
+            env.set(GATEWAY_SHARED_SECRET_VAR, SECRET_VALUE);
+            env.set(CREDENTIALS_ENCRYPTION_KEY_VAR, encryption_key_hex());
+            env
         }
 
-        fn clear_all(&self) {
-            // Seguro por la misma razón que en `set_valid_env`.
-            unsafe {
-                std::env::remove_var(DATABASE_URL_VAR);
-                std::env::remove_var(HTTP_HOST_VAR);
-                std::env::remove_var(HTTP_PORT_VAR);
-                std::env::remove_var(GATEWAY_SHARED_SECRET_VAR);
-                std::env::remove_var(MIGRATIONS_DATABASE_URL_VAR);
-                std::env::remove_var(CREDENTIALS_ENCRYPTION_KEY_VAR);
-                std::env::remove_var(ADMIN_BOOTSTRAP_EMAILS_VAR);
-            }
+        fn set(&mut self, name: &'static str, value: impl Into<OsString>) {
+            self.0.insert(name, value.into());
         }
-    }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            self.clear_all();
+        fn remove(&mut self, name: &'static str) {
+            self.0.remove(name);
+        }
+
+        fn load(&self) -> Result<Config, ConfigError> {
+            Config::from_lookup(|name| self.0.get(name).cloned())
         }
     }
 
     #[test]
-    fn from_env_loads_valid_config_successfully() {
-        let guard = EnvGuard::set_valid_env();
-
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+    fn from_lookup_loads_valid_config_successfully() {
+        let config = FakeEnv::valid()
+            .load()
+            .expect("la configuración válida debe cargar sin error");
 
         assert_eq!(config.database_url, "postgres://user:pass@localhost/db");
         assert_eq!(config.http_host, "0.0.0.0");
@@ -313,41 +325,28 @@ mod tests {
             config.credentials_encryption_key.expose_secret(),
             &[0x07u8; 32]
         );
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_returns_typed_error_when_encryption_key_is_missing() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::remove_var(CREDENTIALS_ENCRYPTION_KEY_VAR);
-        }
-
-        let result = Config::from_env();
+    fn from_lookup_returns_typed_error_when_encryption_key_is_missing() {
+        let mut env = FakeEnv::valid();
+        env.remove(CREDENTIALS_ENCRYPTION_KEY_VAR);
 
         assert!(matches!(
-            result,
+            env.load(),
             Err(ConfigError::MissingVar {
                 variable: CREDENTIALS_ENCRYPTION_KEY_VAR
             })
         ));
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_returns_typed_error_when_encryption_key_is_not_valid_hex_of_32_bytes() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(CREDENTIALS_ENCRYPTION_KEY_VAR, "no-es-hex");
-        }
+    fn from_lookup_returns_typed_error_when_encryption_key_is_not_valid_hex_of_32_bytes() {
+        let mut env = FakeEnv::valid();
+        env.set(CREDENTIALS_ENCRYPTION_KEY_VAR, "no-es-hex");
 
-        let result = Config::from_env();
         assert!(matches!(
-            result,
+            env.load(),
             Err(ConfigError::InvalidEncryptionKey {
                 variable: CREDENTIALS_ENCRYPTION_KEY_VAR
             })
@@ -355,53 +354,46 @@ mod tests {
 
         // Longitud incorrecta (62 caracteres hex = 31 bytes) también es un
         // error tipado.
-        unsafe {
-            std::env::set_var(
-                CREDENTIALS_ENCRYPTION_KEY_VAR,
-                "07070707070707070707070707070707070707070707070707070707070707",
-            );
-        }
+        env.set(
+            CREDENTIALS_ENCRYPTION_KEY_VAR,
+            "07070707070707070707070707070707070707070707070707070707070707",
+        );
 
-        let result = Config::from_env();
         assert!(matches!(
-            result,
+            env.load(),
             Err(ConfigError::InvalidEncryptionKey {
                 variable: CREDENTIALS_ENCRYPTION_KEY_VAR
             })
         ));
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_defaults_to_no_admins_when_admin_bootstrap_emails_is_unset_or_empty() {
-        let guard = EnvGuard::set_valid_env();
+    fn from_lookup_defaults_to_no_admins_when_admin_bootstrap_emails_is_unset_or_empty() {
+        let mut env = FakeEnv::valid();
 
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        let config = env
+            .load()
+            .expect("la configuración válida debe cargar sin error");
         assert!(config.admin_bootstrap_emails.is_empty());
 
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(ADMIN_BOOTSTRAP_EMAILS_VAR, "  ");
-        }
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        env.set(ADMIN_BOOTSTRAP_EMAILS_VAR, "  ");
+        let config = env
+            .load()
+            .expect("la configuración válida debe cargar sin error");
         assert!(config.admin_bootstrap_emails.is_empty());
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_loads_admin_bootstrap_emails_trimmed_and_case_insensitive() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(
-                ADMIN_BOOTSTRAP_EMAILS_VAR,
-                " Admin-1@Example.test, admin-2@example.test ",
-            );
-        }
+    fn from_lookup_loads_admin_bootstrap_emails_trimmed_and_case_insensitive() {
+        let mut env = FakeEnv::valid();
+        env.set(
+            ADMIN_BOOTSTRAP_EMAILS_VAR,
+            " Admin-1@Example.test, admin-2@example.test ",
+        );
 
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        let config = env
+            .load()
+            .expect("la configuración válida debe cargar sin error");
 
         assert_eq!(config.admin_bootstrap_emails.len(), 2);
         assert!(config
@@ -410,22 +402,17 @@ mod tests {
         assert!(config
             .admin_bootstrap_emails
             .contains("ADMIN-2@example.test"));
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_returns_typed_error_without_the_value_when_an_admin_email_is_invalid() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(
-                ADMIN_BOOTSTRAP_EMAILS_VAR,
-                "admin-1@example.test,secret-typo",
-            );
-        }
+    fn from_lookup_returns_typed_error_without_the_value_when_an_admin_email_is_invalid() {
+        let mut env = FakeEnv::valid();
+        env.set(
+            ADMIN_BOOTSTRAP_EMAILS_VAR,
+            "admin-1@example.test,secret-typo",
+        );
 
-        let error = Config::from_env().expect_err("una entrada inválida debe fallar");
+        let error = env.load().expect_err("una entrada inválida debe fallar");
 
         assert!(matches!(
             error,
@@ -434,129 +421,115 @@ mod tests {
             }
         ));
         assert!(!error.to_string().contains("secret-typo"));
-
-        drop(guard);
     }
 
     #[test]
     fn debug_format_of_config_never_contains_admin_emails() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(ADMIN_BOOTSTRAP_EMAILS_VAR, "admin-1@example.test");
-        }
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        let mut env = FakeEnv::valid();
+        env.set(ADMIN_BOOTSTRAP_EMAILS_VAR, "admin-1@example.test");
+        let config = env
+            .load()
+            .expect("la configuración válida debe cargar sin error");
 
         let debug_output = format!("{config:?}");
 
         assert!(!debug_output.contains("admin-1"));
-
-        drop(guard);
     }
 
     #[cfg(unix)]
     #[test]
-    fn from_env_fails_closed_when_admin_bootstrap_emails_is_not_valid_utf8() {
+    fn from_lookup_fails_closed_when_admin_bootstrap_emails_is_not_valid_utf8() {
         use std::os::unix::ffi::OsStringExt;
 
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(
-                ADMIN_BOOTSTRAP_EMAILS_VAR,
-                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
-            );
-        }
-
-        let result = Config::from_env();
+        let mut env = FakeEnv::valid();
+        env.set(
+            ADMIN_BOOTSTRAP_EMAILS_VAR,
+            OsString::from_vec(vec![0xff, 0xfe]),
+        );
 
         assert!(matches!(
-            result,
+            env.load(),
             Err(ConfigError::InvalidAdminEmails {
                 variable: ADMIN_BOOTSTRAP_EMAILS_VAR
             })
         ));
+    }
 
-        drop(guard);
+    #[cfg(unix)]
+    #[test]
+    fn from_lookup_treats_non_utf8_required_var_as_missing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut env = FakeEnv::valid();
+        env.set(HTTP_HOST_VAR, OsString::from_vec(vec![0xff, 0xfe]));
+
+        assert!(matches!(
+            env.load(),
+            Err(ConfigError::MissingVar {
+                variable: HTTP_HOST_VAR
+            })
+        ));
     }
 
     #[test]
-    fn from_env_returns_typed_error_when_required_var_is_missing() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::remove_var(GATEWAY_SHARED_SECRET_VAR);
-        }
-
-        let result = Config::from_env();
+    fn from_lookup_returns_typed_error_when_required_var_is_missing() {
+        let mut env = FakeEnv::valid();
+        env.remove(GATEWAY_SHARED_SECRET_VAR);
 
         assert!(matches!(
-            result,
+            env.load(),
             Err(ConfigError::MissingVar {
                 variable: GATEWAY_SHARED_SECRET_VAR
             })
         ));
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_returns_typed_error_when_port_is_not_a_valid_u16() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(HTTP_PORT_VAR, "not-a-port");
-        }
-
-        let result = Config::from_env();
+    fn from_lookup_returns_typed_error_when_port_is_not_a_valid_u16() {
+        let mut env = FakeEnv::valid();
+        env.set(HTTP_PORT_VAR, "not-a-port");
 
         assert!(matches!(
-            result,
+            env.load(),
             Err(ConfigError::InvalidPort {
                 variable: HTTP_PORT_VAR
             })
         ));
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_loads_migrations_database_url_when_present() {
-        let guard = EnvGuard::set_valid_env();
-        // Seguro por la misma razón que en `EnvGuard::set_valid_env`.
-        unsafe {
-            std::env::set_var(
-                MIGRATIONS_DATABASE_URL_VAR,
-                "postgres://migrator:pass@localhost/db",
-            );
-        }
+    fn from_lookup_loads_migrations_database_url_when_present() {
+        let mut env = FakeEnv::valid();
+        env.set(
+            MIGRATIONS_DATABASE_URL_VAR,
+            "postgres://migrator:pass@localhost/db",
+        );
 
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        let config = env
+            .load()
+            .expect("la configuración válida debe cargar sin error");
 
         assert_eq!(
             config.migrations_database_url,
             "postgres://migrator:pass@localhost/db"
         );
         assert_eq!(config.database_url, "postgres://user:pass@localhost/db");
-
-        drop(guard);
     }
 
     #[test]
-    fn from_env_falls_back_to_database_url_when_migrations_database_url_is_absent() {
-        let guard = EnvGuard::set_valid_env();
-
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+    fn from_lookup_falls_back_to_database_url_when_migrations_database_url_is_absent() {
+        let config = FakeEnv::valid()
+            .load()
+            .expect("la configuración válida debe cargar sin error");
 
         assert_eq!(config.migrations_database_url, config.database_url);
-
-        drop(guard);
     }
 
     #[test]
     fn debug_format_of_config_never_contains_the_raw_secret() {
-        let guard = EnvGuard::set_valid_env();
-        let config = Config::from_env().expect("la configuración válida debe cargar sin error");
+        let config = FakeEnv::valid()
+            .load()
+            .expect("la configuración válida debe cargar sin error");
 
         let debug_output = format!("{config:?}");
 
@@ -568,7 +541,5 @@ mod tests {
             !debug_output.contains(encryption_key_hex()),
             "el Debug de Config no debe filtrar la clave de cifrado de credenciales"
         );
-
-        drop(guard);
     }
 }

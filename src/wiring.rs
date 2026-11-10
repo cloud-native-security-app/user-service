@@ -22,6 +22,8 @@
 //! puede omitirse por completo, ver `src/config.rs`); en producción el
 //! operador las separa.
 
+use std::time::Duration;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -32,6 +34,15 @@ use sqlx::PgPool;
 use crate::api;
 use crate::config::Config;
 use crate::repository::Repository;
+
+/// Tiempo máximo de espera para establecer una conexión con PostgreSQL al
+/// arrancar (pool de migraciones y pool de aplicación).
+///
+/// Sin este límite `sqlx` reintenta durante su valor por defecto (30 s) antes
+/// de rendirse. 10 s sobra para un handshake TCP/TLS contra una base de datos
+/// sana o recién levantada y, si no responde, el proceso falla con un error
+/// tipado lo bastante rápido para que el orquestador lo reinicie.
+const DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Aplica las migraciones pendientes de `migrations/` contra
 /// [`Config::migrations_database_url`] y, si tiene éxito, construye el
@@ -49,9 +60,20 @@ use crate::repository::Repository;
 /// dos pools, o si la aplicación de migraciones falla. Nunca hace
 /// `panic!` ni deja el router a medio ensamblar.
 pub async fn build_router(config: &Config) -> Result<Router, WiringError> {
-    migrate(&config.migrations_database_url).await?;
+    build_router_with_connect_timeout(config, DATABASE_CONNECT_TIMEOUT).await
+}
+
+/// Igual que [`build_router`], pero con un `connect_timeout` explícito para
+/// ambos pools; permite a los tests usar un límite corto sin cambiar el
+/// valor de producción.
+async fn build_router_with_connect_timeout(
+    config: &Config,
+    connect_timeout: Duration,
+) -> Result<Router, WiringError> {
+    migrate(&config.migrations_database_url, connect_timeout).await?;
 
     let database_pool = PgPoolOptions::new()
+        .acquire_timeout(connect_timeout)
         .connect(&config.database_url)
         .await
         .map_err(|_| WiringError::DatabaseConnectionFailed)?;
@@ -81,8 +103,12 @@ pub async fn build_router(config: &Config) -> Result<Router, WiringError> {
 /// pendientes de `migrations/` (`sqlx::migrate!`, embebidas en el binario en
 /// tiempo de compilación). El pool se cierra al terminar: solo migra el
 /// esquema, nunca sirve tráfico HTTP.
-async fn migrate(migrations_database_url: &str) -> Result<(), WiringError> {
+async fn migrate(
+    migrations_database_url: &str,
+    connect_timeout: Duration,
+) -> Result<(), WiringError> {
     let migrations_pool = PgPoolOptions::new()
+        .acquire_timeout(connect_timeout)
         .connect(migrations_database_url)
         .await
         .map_err(|_| WiringError::MigrationsConnectionFailed)?;
@@ -166,7 +192,14 @@ mod tests {
             admin_bootstrap_emails: Default::default(),
         };
 
-        let result = build_router(&config).await;
+        // Cota de seguridad ante cuelgues: con `acquire_timeout` de 1 s el
+        // fallo llega en ~1 s; 10 s detecta una regresión (antes: 30 s).
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            build_router_with_connect_timeout(&config, Duration::from_secs(1)),
+        )
+        .await
+        .expect("la conexión inalcanzable debe fallar dentro de una cota, no colgarse");
 
         assert!(matches!(
             result,
