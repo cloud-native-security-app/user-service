@@ -97,3 +97,40 @@ de aplicación conserva `UPDATE` a nivel de tabla sobre `users` (la
 reconciliación corre con ese rol); la garantía de que no se escribe desde
 peticiones está en la aplicación y en sus tests. El correo proviene de la
 identidad verificada por el Gateway (`X-Forwarded-User`).
+
+## ADR-013 Eventos de seguridad `audit.recorded` hacia Kinesis
+
+Contexto: el panel de administración (KAP-09) lee el stream `security-events`;
+el contrato es `broker/contracts/security-event.schema.json` y
+`user-service` produce `audit.recorded`, espejo de lo que hacen el Gateway
+(KAP-06) y ms-nmap (KAP-07).
+
+**Decisión:** el puerto `SecurityEventPublisher` (`src/security_events.rs`) y
+su adaptador Kinesis (`src/messaging/kinesis.rs`, `aws-sdk-kinesis` 1.125.0)
+publican un evento por cada entrada de `audit_log`. `Repository` emite **después**
+de confirmar la escritura (tras `commit` en `reconcile_roles` y
+`record_scan_request`; tras el `INSERT` en autocommit de `append_audit_entry`),
+de modo que un rollback nunca emite. La emisión es una tarea `tokio`
+desacoplada con tope de 5 s por evento que solo loggea el tipo de evento: un
+Kinesis caído no cambia ninguna respuesta HTTP ni la fila de auditoría. El
+costo, aceptado, es que un evento puede perderse si el proceso muere antes de
+publicar (`audit_log` es la fuente de verdad; sin reintentos ni outbox).
+
+Mapeo (`audit::recorded_event`; cualquier otra acción no se publica, porque su
+texto no es un código conocido):
+
+| `audit_log.action` | `payload.action` | `payload.resource_type` |
+|---|---|---|
+| `scan_requested` | `scan.requested` | `scan` |
+| `role.granted` | `role.granted` | `user` |
+| `role.revoked` | `role.revoked` | `user` |
+
+`actor_sub` es el `user_id` de la entrada: en `scan_requested`, quien pidió el
+escaneo; en `role.granted`/`role.revoked`, el usuario cuyo rol cambió (el cambio
+lo aplica la lista `ADMIN_BOOTSTRAP_EMAILS`, no una persona). Es también la
+clave de partición. El evento nunca lleva correo, nombre, objetivo del escaneo,
+rol resultante ni texto libre. `SECURITY_EVENTS_STREAM_NAME` ausente o en
+blanco activa el adaptador no-op con un único log informativo al arrancar.
+`tests/security_event_contract.rs` valida cada evento contra el schema del
+broker y `tests/kinesis_publisher_localstack.rs` /
+`tests/audit_events_localstack.rs` lo hacen contra LocalStack.

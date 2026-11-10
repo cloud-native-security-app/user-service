@@ -2,7 +2,7 @@
 
 - Engram topic: `odd/security-event-publisher/tasks` (project: `user-service`)
 - Branch: `feature/security_event_publisher` (off origin/develop 974bf9c)
-- Status: in progress (2026-11-10)
+- Status: done (2026-11-10)
 - Master plan: repo `infra`, `odd/tasks/kinesis-admin-panel.md` (task KAP-08). Mirror of the gateway (KAP-06) and nmap-service (KAP-07) work.
 
 ## Objective
@@ -52,15 +52,36 @@ user-service publishes an `audit.recorded` security event to the Kinesis stream 
 
 ## Checklist
 
-- [x] SEP-01 Feature doc.
-- [ ] SEP-02 `SecurityEvent` envelope, port, recorder/no-op adapters, `emit`/`emit_all`, `audit::recorded_event`, schema parity tests.
-- [ ] SEP-03 Kinesis adapter, `SECURITY_EVENTS_STREAM_NAME`, wiring, LocalStack test.
-- [ ] SEP-04 Emission after commit in the repository, with failing-publisher tests (repository and HTTP).
-- [ ] SEP-05 `docs/decisions.md` (ADR-013), README env table, this doc closed.
+- [x] SEP-01 Feature doc (ab5647d).
+- [x] SEP-02 `SecurityEvent` envelope, port, recorder/no-op adapters, `emit`/`emit_all`, `audit::recorded_event`, schema parity tests (404817c).
+- [x] SEP-03 Kinesis adapter, `SECURITY_EVENTS_STREAM_NAME`, `AWS_REGION`/`AWS_ENDPOINT_URL`, wiring, LocalStack test (146fd8d).
+- [x] SEP-04 Emission after commit in the repository, with failing-publisher tests (repository and HTTP) and an end-to-end Postgres + LocalStack test (ca18f0c).
+- [x] SEP-05 `docs/decisions.md` (ADR-013), README env table, this doc closed (docs commit on top of ca18f0c).
+
+## Emission points
+
+| Event | Where | Condition |
+|---|---|---|
+| `audit.recorded` (`role.granted`/`role.revoked`) | `src/repository.rs` `Repository::reconcile_roles` (startup via `wiring::build_router`, and `PUT /users/me` via `reconcile_user_role`) | after `tx.commit()`, one per changed role |
+| `audit.recorded` (`scan.requested`) | `Repository::record_scan_request` (`POST /users/me/scans`) | after `tx.commit()` |
+| `audit.recorded` (mapped actions only) | `Repository::append_audit_entry` | after the autocommit `INSERT`; no caller in `src/` today |
+
+All go through `Repository::emit_audit_recorded` -> `audit::recorded_event` -> `security_events::emit_all`.
 
 ## Evidence
 
-(filled per task)
+- RED SEP-02: `cargo test --lib --no-run` failed with 45 compile errors (`SecurityEvent`, `emit`, `EventSource`, publishers not found) and the contract/audit tests did not compile. GREEN: 17 `security_events` unit tests (envelope, validation, partition key, no-op/recorder, `emit`/`emit_all` failure, batch stop, 5 s timeout with a paused clock, no runtime), 4 `audit::recorded_event` tests, 5 contract tests (`tests/security_event_contract.rs`: every mapped action validates against the schema, boundaries, the schema rejects invalid events, the 11 broker examples round-trip, the audit example equals the constructor output).
+- RED SEP-03: `cargo test --lib --no-run` failed with 19 compile errors (`SECURITY_EVENTS_STREAM_NAME_VAR`, `AWS_REGION_VAR`, `security_events_stream_name` missing); the LocalStack test did not compile (`user_service::messaging` missing). GREEN: 4 config tests via `Config::from_lookup`; `cargo test --test kinesis_publisher_localstack -- --ignored` 2 passed (3 events read back with `actor_sub` as partition key and schema validation; missing stream gives `PublishFailed` without the body).
+- RED SEP-04: with the tests written first, `record_scan_request_emits_...`, `append_audit_entry_emits_...`, `role_reconciliation_emits_...` and `post_scan_emits_scan_requested_...` failed (no event arrived); the rollback and failing-publisher tests passed as regression guards. GREEN after emitting from `Repository`: all pass, plus `tests/audit_events_localstack.rs` (real Postgres + real Kinesis: `role.granted` and `scan.requested` read back valid).
+- Final: `make verify` exit 0 (fmt, clippy `-D warnings`, tests, ignored Docker suites: 50 api, 46 repository, plus the new Kinesis and end-to-end suites; all passed, `cargo doc`); `cargo test --lib` 81 passed on three consecutive runs. `cargo doc` keeps one warning that predates this feature (`api` links to private `validate_scan_update`).
+- Review: none run (stored user policy: decline).
+
+## Known limitations
+
+- Events can be lost if the process dies before the spawned task publishes; no retry or outbox (D1).
+- `occurred_at` is the emission time, not `audit_log.recorded_at` (D5).
+- An audit action without a mapping is not published (D4); today every action written by the service is mapped.
+- Deployment: the ECS task role needs `kinesis:PutRecord` on the stream and the task needs `SECURITY_EVENTS_STREAM_NAME` (infra repo, not changed here). `docs/architecture.md` and `docs/security-scope.md` do not exist in this repo (only `docs/decisions.md`), so ADR-013 carries the architecture note.
 
 ## Next step
 
