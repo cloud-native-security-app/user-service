@@ -31,10 +31,10 @@ The stored scan result keeps the optional `port`/`protocol` of each `VulnFinding
 
 | ID | Task | Done |
 |---|---|---|
-| FP-01 | Feature document | [ ] |
-| FP-02 | Characterization tests: repository and report endpoint round trip with/without port | [ ] |
-| FP-03 | Docs: ADR-014 | [ ] |
-| FP-04 | `make verify` | [ ] |
+| FP-01 | Feature document | [x] fe93430 |
+| FP-02 | Characterization tests: repository and report endpoint round trip with/without port | [x] 2 Docker tests pass, 3d78327 |
+| FP-03 | Docs: ADR-014 | [x] same commit |
+| FP-04 | `make verify` | [x] exit 0 |
 
 ## TDD note
 
