@@ -134,3 +134,17 @@ blanco activa el adaptador no-op con un único log informativo al arrancar.
 `tests/security_event_contract.rs` valida cada evento contra el schema del
 broker y `tests/kinesis_publisher_localstack.rs` /
 `tests/audit_events_localstack.rs` lo hacen contra LocalStack.
+
+## ADR-014 Puerto y protocolo de un hallazgo en el resultado almacenado
+
+- **Decisión:** no se cambia código ni esquema. `scan_history.result` es `JSONB`
+  y el reporte (`GET /users/me/scans/{scan_id}/report`) devuelve el valor
+  almacenado sin interpretarlo, por lo que los campos opcionales `port` y
+  `protocol` de cada `VulnFinding` (ausentes, `null` o con valor) viajan intactos.
+- **Contexto:** `nmap-service` pasa a informar el puerto de cada hallazgo
+  (`broker/contracts/scan-outcome.schema.json`, D-15 del broker) para que el
+  reporte indique dónde está la vulnerabilidad.
+- **Consecuencia:** no hay migración. Los tests de caracterización
+  (`tests/repository.rs`, `tests/api.rs`) fijan el round trip para que un futuro
+  modelo tipado de `result` no descarte los campos. Si el almacenamiento pasara
+  a ser columnar, habría que añadir las columnas con una migración aditiva.

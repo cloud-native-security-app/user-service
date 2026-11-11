@@ -1322,6 +1322,35 @@ async fn patch_completed_with_result_then_report_returns_the_result() {
 
 #[tokio::test]
 #[ignore = "requiere Docker"]
+async fn report_returns_the_port_and_protocol_of_each_finding_verbatim() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    let scan_id = create_scan_for(&router, "finding-port-owner").await;
+    let result = json!({
+        "ports": [],
+        "vulnerabilities": [
+            {"id": "CVE-2024-0001", "severity": "high", "port": 22, "protocol": "tcp"},
+            {"id": "CVE-2024-0002", "severity": "low", "port": null, "protocol": null},
+            {"id": "CVE-2024-0003", "severity": "low"},
+        ]
+    });
+
+    let patch = patch_scan(
+        &router,
+        "finding-port-owner",
+        &scan_id,
+        json!({"status": "COMPLETADO", "result": result}),
+    )
+    .await;
+    assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+
+    let report = get_report(&router, "finding-port-owner", &scan_id).await;
+    assert_eq!(report.status(), StatusCode::OK);
+    assert_eq!(body_json(report).await, result);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
 async fn history_entries_never_include_the_full_result() {
     let db = start_test_db().await;
     let router = test_router(db.app_pool.clone());
