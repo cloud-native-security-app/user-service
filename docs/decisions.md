@@ -114,7 +114,10 @@ de modo que un rollback nunca emite. La emisión es una tarea `tokio`
 desacoplada con tope de 5 s por evento que solo loggea el tipo de evento: un
 Kinesis caído no cambia ninguna respuesta HTTP ni la fila de auditoría. El
 costo, aceptado, es que un evento puede perderse si el proceso muere antes de
-publicar (`audit_log` es la fuente de verdad; sin reintentos ni outbox).
+publicar (`audit_log` es la fuente de verdad; sin outbox). Cada evento se reintenta
+en memoria hasta 3 veces con backoff exponencial y jitter completo (100 ms
+base, 1,5 s por intento) dentro del tope de 5 s, y un fallo no descarta el
+resto del lote.
 
 Mapeo (`audit::recorded_event`; cualquier otra acción no se publica, porque su
 texto no es un código conocido):
