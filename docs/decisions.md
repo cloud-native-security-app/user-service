@@ -98,6 +98,28 @@ reconciliación corre con ese rol); la garantía de que no se escribe desde
 peticiones está en la aplicación y en sus tests. El correo proviene de la
 identidad verificada por el Gateway (`X-Forwarded-User`).
 
+## ADR-015 Permiso de escaneo en modo red por lista de cuentas
+
+El escaneo en modo red (sin credenciales) queda limitado a una lista de cuentas
+(decisión del usuario, uso académico). `users.can_network_scan BOOLEAN NOT NULL
+DEFAULT false` se expone como `can_network_scan` en `GET`/`PUT /users/me`
+(campo aditivo; un consumidor anterior lo ignora). El Gateway lo lee al iniciar
+sesión y lo revalida contra `GET /users/me` en cada escaneo de red, igual que
+`require_admin` con `role`: no hay endpoint nuevo.
+
+`NETWORK_SCAN_EMAILS` sigue el patrón de ADR-012: lista separada por comas,
+**autoritativa** (los listados tienen el permiso, el resto no; vacía = nadie),
+idempotente, aplicada al arrancar sobre todas las filas y en el aprovisionamiento
+del perfil. Un correo aún no registrado no crea filas: recibe el permiso en su
+primer `PUT /users/me`. Es independiente de `ADMIN_BOOTSTRAP_EMAILS` (un admin
+no tiene el permiso salvo que figure en la lista). Nunca se acepta desde un
+cuerpo de petición.
+
+Decisión: el cambio de permiso **no** se audita en `audit_log` (a diferencia del
+rol), porque las acciones de auditoría son un contrato cerrado con el stream
+`security-events`; el estado vigente queda en `users` y la lista en la
+configuración versionada de infraestructura.
+
 ## ADR-013 Eventos de seguridad `audit.recorded` hacia Kinesis
 
 Contexto: el panel de administración (KAP-09) lee el stream `security-events`;

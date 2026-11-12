@@ -259,6 +259,7 @@ async fn put_profile(
         // Solo marcador: `upsert_user` nunca persiste este valor y la
         // respuesta se relee de la base de datos.
         role: Role::User,
+        can_network_scan: false,
         created_at: Utc::now(),
     };
 
@@ -273,6 +274,14 @@ async fn put_profile(
     state
         .repository
         .reconcile_user_role(&profile.user_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Igual con `NETWORK_SCAN_EMAILS`: un usuario listado que inicia sesión
+    // por primera vez recibe el permiso de inmediato.
+    state
+        .repository
+        .reconcile_user_network_scan(&profile.user_id)
         .await
         .map_err(ApiError::from)?;
 

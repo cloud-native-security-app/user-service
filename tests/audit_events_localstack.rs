@@ -62,6 +62,7 @@ async fn audit_writes_reach_the_kinesis_stream_with_valid_bodies_and_actor_sub_p
             email: format!("{user}@example.test"),
             display_name: "Test User".to_string(),
             role: Role::User,
+            can_network_scan: false,
             created_at: now,
         })
         .await

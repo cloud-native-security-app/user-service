@@ -29,7 +29,7 @@ use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tower::ServiceExt;
 
 use user_service::api::{self, FORWARDED_USER_HEADER, GATEWAY_SECRET_HEADER};
-use user_service::domain::AdminEmails;
+use user_service::domain::{AdminEmails, NetworkScanEmails};
 use user_service::repository::Repository;
 use user_service::security_events::{
     RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError, SecurityEventPublisher,
@@ -131,6 +131,15 @@ fn test_router_with_admins(pool: PgPool, admin_emails: &str) -> Router {
     api::router(
         Repository::new(pool, test_encryption_key())
             .with_admin_emails(AdminEmails::parse(admin_emails).expect("lista válida")),
+        SecretString::from(TEST_GATEWAY_SECRET.to_string()),
+    )
+}
+
+/// Igual que [`test_router`], con `NETWORK_SCAN_EMAILS` ya parseada.
+fn test_router_with_network_scan(pool: PgPool, emails: &str) -> Router {
+    api::router(
+        Repository::new(pool, test_encryption_key())
+            .with_network_scan_emails(NetworkScanEmails::parse(emails).expect("lista válida")),
         SecretString::from(TEST_GATEWAY_SECRET.to_string()),
     )
 }
@@ -1888,6 +1897,79 @@ async fn provisioning_again_does_not_duplicate_the_grant_and_a_removed_email_is_
         role_audit_actions(&unlisted, "boss-sub").await,
         ["role.granted", "role.revoked"]
     );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn profile_exposes_can_network_scan_false_by_default() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+
+    let put = put_profile_as(
+        &router,
+        "ns-sub",
+        "ns@example.test",
+        json!({"display_name": "N"}),
+    )
+    .await;
+    assert_eq!(put["can_network_scan"], false);
+
+    let response = router
+        .clone()
+        .oneshot(request_to_with_headers(
+            "GET",
+            "/users/me",
+            Some("ns-sub"),
+            Some(TEST_GATEWAY_SECRET),
+            Body::empty(),
+        ))
+        .await
+        .expect("GET");
+    assert_eq!(body_json(response).await["can_network_scan"], false);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn first_login_of_a_listed_email_gets_network_scan_and_a_removed_email_loses_it() {
+    let db = start_test_db().await;
+    let listed = test_router_with_network_scan(db.app_pool.clone(), "Ana@Example.test");
+
+    let payload = put_profile_as(
+        &listed,
+        "ana-sub",
+        "ana@example.test",
+        json!({"display_name": "Ana"}),
+    )
+    .await;
+    assert_eq!(payload["can_network_scan"], true);
+    assert_eq!(payload["role"], "user");
+
+    let unlisted = test_router_with_network_scan(db.app_pool.clone(), "");
+    let payload = put_profile_as(
+        &unlisted,
+        "ana-sub",
+        "ana@example.test",
+        json!({"display_name": "Ana"}),
+    )
+    .await;
+    assert_eq!(payload["can_network_scan"], false);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn client_sent_can_network_scan_in_the_body_does_not_grant_it() {
+    let db = start_test_db().await;
+    let router = test_router_with_network_scan(db.app_pool.clone(), "ana@example.test");
+
+    let payload = put_profile_as(
+        &router,
+        "mallory-sub",
+        "mallory@example.test",
+        json!({"display_name": "Mallory", "can_network_scan": true}),
+    )
+    .await;
+
+    assert_eq!(payload["can_network_scan"], false);
 }
 
 // --- KAP-08: un publicador de eventos caído no cambia ninguna respuesta ---

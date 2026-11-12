@@ -12,7 +12,7 @@ use std::fmt;
 
 use secrecy::{SecretBox, SecretSlice, SecretString};
 
-use crate::domain::AdminEmails;
+use crate::domain::{AdminEmails, NetworkScanEmails};
 
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
@@ -43,6 +43,11 @@ const CREDENTIALS_ENCRYPTION_KEY_VAR: &str = "CREDENTIALS_ENCRYPTION_KEY";
 /// Nombre de la variable de entorno, **opcional**, con los correos de los
 /// administradores separados por comas (ver [`Config::admin_bootstrap_emails`]).
 const ADMIN_BOOTSTRAP_EMAILS_VAR: &str = "ADMIN_BOOTSTRAP_EMAILS";
+
+/// Nombre de la variable de entorno, **opcional**, con los correos autorizados
+/// a escanear en modo red, separados por comas (ver
+/// [`Config::network_scan_emails`]).
+const NETWORK_SCAN_EMAILS_VAR: &str = "NETWORK_SCAN_EMAILS";
 
 /// Nombre de la variable de entorno, **opcional**, con el nombre del Kinesis
 /// Data Stream de eventos de seguridad (`security-events`). Ausente o en
@@ -100,6 +105,12 @@ pub struct Config {
     /// aquí. Se aplica al arrancar y al aprovisionar el perfil. Su `Debug`
     /// solo muestra la cantidad.
     pub admin_bootstrap_emails: AdminEmails,
+    /// Lista autoritativa de cuentas con permiso de escaneo en modo red, leída
+    /// de `NETWORK_SCAN_EMAILS` (separada por comas; ausente o vacía = nadie):
+    /// un usuario lo tiene si y solo si su correo está aquí. Se aplica (concede
+    /// y revoca) al arrancar y al aprovisionar el perfil. Su `Debug` solo
+    /// muestra la cantidad.
+    pub network_scan_emails: NetworkScanEmails,
     /// Nombre del Kinesis Data Stream de eventos de seguridad. `None`
     /// (variable ausente o en blanco) desactiva la publicación. Ver
     /// [`SECURITY_EVENTS_STREAM_NAME_VAR`].
@@ -129,6 +140,7 @@ impl fmt::Debug for Config {
                 &self.credentials_encryption_key,
             )
             .field("admin_bootstrap_emails", &self.admin_bootstrap_emails)
+            .field("network_scan_emails", &self.network_scan_emails)
             .field(
                 "security_events_stream_name",
                 &self.security_events_stream_name,
@@ -147,6 +159,8 @@ impl Config {
     /// `ADMIN_BOOTSTRAP_EMAILS` es **opcional** (ausente = sin
     /// administradores); una entrada que no sea un correo es un error de
     /// configuración ([`ConfigError::InvalidAdminEmails`]).
+    /// `NETWORK_SCAN_EMAILS` es **opcional** (ausente = nadie puede escanear en
+    /// modo red) y se valida igual ([`ConfigError::InvalidNetworkScanEmails`]).
     /// `MIGRATIONS_DATABASE_URL` es **opcional**: si está ausente,
     /// [`Config::migrations_database_url`] cae de vuelta al valor de
     /// `DATABASE_URL`.
@@ -185,6 +199,7 @@ impl Config {
         let credentials_encryption_key =
             decode_encryption_key(&read_required(&lookup, CREDENTIALS_ENCRYPTION_KEY_VAR)?)?;
         let admin_bootstrap_emails = read_admin_emails(&lookup)?;
+        let network_scan_emails = read_network_scan_emails(&lookup)?;
         let migrations_database_url = lookup(MIGRATIONS_DATABASE_URL_VAR)
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| database_url.clone());
@@ -207,6 +222,7 @@ impl Config {
             credentials_encryption_key,
             migrations_database_url,
             admin_bootstrap_emails,
+            network_scan_emails,
             security_events_stream_name,
             aws_region,
             aws_endpoint_url,
@@ -249,6 +265,21 @@ fn read_admin_emails(
         None => String::new(),
     };
     AdminEmails::parse(&raw).map_err(|_| invalid())
+}
+
+/// Lee `NETWORK_SCAN_EMAILS`: ausente = nadie. Mismas reglas de fallo cerrado
+/// que [`read_admin_emails`].
+fn read_network_scan_emails(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+) -> Result<NetworkScanEmails, ConfigError> {
+    let invalid = || ConfigError::InvalidNetworkScanEmails {
+        variable: NETWORK_SCAN_EMAILS_VAR,
+    };
+    let raw = match lookup(NETWORK_SCAN_EMAILS_VAR) {
+        Some(value) => value.into_string().map_err(|_| invalid())?,
+        None => String::new(),
+    };
+    NetworkScanEmails::parse(&raw).map_err(|_| invalid())
 }
 
 /// Lee una variable opcional: recorta espacios y trata ausente, en blanco o
@@ -345,6 +376,13 @@ pub enum ConfigError {
     /// incluye el valor, que puede ser un correo real mal escrito.
     #[error("la variable de entorno {variable} contiene una entrada que no es un correo válido")]
     InvalidAdminEmails {
+        /// Nombre de la variable de entorno con el valor inválido.
+        variable: &'static str,
+    },
+    /// Alguna entrada de `NETWORK_SCAN_EMAILS` no es un correo válido. No
+    /// incluye el valor, que puede ser un correo real mal escrito.
+    #[error("la variable de entorno {variable} contiene una entrada que no es un correo válido")]
+    InvalidNetworkScanEmails {
         /// Nombre de la variable de entorno con el valor inválido.
         variable: &'static str,
     },
@@ -520,6 +558,76 @@ mod tests {
         let debug_output = format!("{config:?}");
 
         assert!(!debug_output.contains("admin-1"));
+    }
+
+    #[test]
+    fn from_lookup_defaults_to_nobody_when_network_scan_emails_is_unset_or_empty() {
+        let mut env = FakeEnv::valid();
+        assert!(env.load().unwrap().network_scan_emails.is_empty());
+
+        env.set(NETWORK_SCAN_EMAILS_VAR, "  ");
+        assert!(env.load().unwrap().network_scan_emails.is_empty());
+    }
+
+    #[test]
+    fn from_lookup_loads_network_scan_emails_trimmed_and_case_insensitive() {
+        let mut env = FakeEnv::valid();
+        env.set(
+            NETWORK_SCAN_EMAILS_VAR,
+            " Ana@Example.test, bob@example.test ",
+        );
+
+        let config = env.load().unwrap();
+
+        assert_eq!(config.network_scan_emails.len(), 2);
+        assert!(config.network_scan_emails.contains("ana@example.test"));
+        assert!(config.network_scan_emails.contains("BOB@example.test"));
+        assert!(config.admin_bootstrap_emails.is_empty());
+    }
+
+    #[test]
+    fn from_lookup_returns_typed_error_without_the_value_when_a_network_scan_email_is_invalid() {
+        let mut env = FakeEnv::valid();
+        env.set(NETWORK_SCAN_EMAILS_VAR, "ana@example.test,secret-typo");
+
+        let error = env.load().expect_err("una entrada inválida debe fallar");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidNetworkScanEmails {
+                variable: NETWORK_SCAN_EMAILS_VAR
+            }
+        ));
+        assert!(!error.to_string().contains("secret-typo"));
+    }
+
+    #[test]
+    fn debug_format_of_config_never_contains_network_scan_emails() {
+        let mut env = FakeEnv::valid();
+        env.set(NETWORK_SCAN_EMAILS_VAR, "ana-secret@example.test");
+
+        let debug_output = format!("{:?}", env.load().unwrap());
+
+        assert!(!debug_output.contains("ana-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_lookup_fails_closed_when_network_scan_emails_is_not_valid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut env = FakeEnv::valid();
+        env.set(
+            NETWORK_SCAN_EMAILS_VAR,
+            OsString::from_vec(vec![0xff, 0xfe]),
+        );
+
+        assert!(matches!(
+            env.load(),
+            Err(ConfigError::InvalidNetworkScanEmails {
+                variable: NETWORK_SCAN_EMAILS_VAR
+            })
+        ));
     }
 
     #[cfg(unix)]
