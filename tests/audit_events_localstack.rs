@@ -77,6 +77,7 @@ async fn audit_writes_reach_the_kinesis_stream_with_valid_bodies_and_actor_sub_p
         requested_at: now,
         updated_at: now,
         failure_reason: None,
+        scan_mode: user_service::domain::ScanMode::Ssh,
     };
     let audit = AuditEntry::new("e2e-audit", "e2e-user", "192.0.2.77", "scan_requested", now);
     repo.record_scan_request(&scan, &audit)

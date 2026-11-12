@@ -179,6 +179,39 @@ pub enum ScanStatus {
     Cancelado,
 }
 
+/// Modo de un escaneo: `ssh` (con credenciales) o `network` (solo por IP).
+///
+/// Enum cerrado: un valor desconocido falla la deserialización. El valor por
+/// defecto es `ssh`, el único modo que existía antes de este campo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanMode {
+    /// Escaneo con credenciales SSH (valor por defecto).
+    #[default]
+    Ssh,
+    /// Escaneo de red solo por IP, sin credenciales.
+    Network,
+}
+
+impl ScanMode {
+    /// `TEXT` almacenado en `scan_history.scan_mode`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ScanMode::Ssh => "ssh",
+            ScanMode::Network => "network",
+        }
+    }
+
+    /// Decodifica el `TEXT` de `scan_history.scan_mode`.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "ssh" => Some(ScanMode::Ssh),
+            "network" => Some(ScanMode::Network),
+            _ => None,
+        }
+    }
+}
+
 /// Entrada del histórico de escaneos solicitados por un usuario (RF-13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanHistoryEntry {
@@ -198,6 +231,10 @@ pub struct ScanHistoryEntry {
     /// completo del escaneo nunca forma parte de esta entrada: se lee con
     /// `GET /users/me/scans/{scan_id}/report`.
     pub failure_reason: Option<String>,
+    /// Modo del escaneo (`ssh` o `network`). Las entradas sin el campo se
+    /// leen como `ssh`.
+    #[serde(default)]
+    pub scan_mode: ScanMode,
 }
 
 /// Estado y resultado almacenado de un escaneo, tal como lo lee el endpoint
@@ -459,6 +496,7 @@ mod tests {
             requested_at: sample_timestamp(),
             updated_at: sample_timestamp(),
             failure_reason: Some("host inalcanzable".to_string()),
+            scan_mode: ScanMode::Network,
         };
 
         let json = serde_json::to_string(&entry).expect("serializa");
@@ -509,6 +547,30 @@ mod tests {
     }
 
     #[test]
+    fn scan_mode_json_encoding_is_stable_and_closed() {
+        assert_eq!(serde_json::to_string(&ScanMode::Ssh).unwrap(), "\"ssh\"");
+        assert_eq!(
+            serde_json::to_string(&ScanMode::Network).unwrap(),
+            "\"network\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ScanMode>("\"network\"").unwrap(),
+            ScanMode::Network
+        );
+        assert!(serde_json::from_str::<ScanMode>("\"telnet\"").is_err());
+        assert_eq!(ScanMode::default(), ScanMode::Ssh);
+    }
+
+    #[test]
+    fn scan_history_entry_without_scan_mode_deserializes_as_ssh() {
+        let json = r#"{"scan_id":"s","user_id":"u","target":"192.0.2.10","status":"PENDIENTE","requested_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","failure_reason":null}"#;
+
+        let entry: ScanHistoryEntry = serde_json::from_str(json).expect("deserializa");
+
+        assert_eq!(entry.scan_mode, ScanMode::Ssh);
+    }
+
+    #[test]
     fn scan_status_cancelado_encoding_is_stable() {
         assert_eq!(
             serde_json::to_string(&ScanStatus::Cancelado).unwrap(),
@@ -530,11 +592,13 @@ mod tests {
             requested_at: sample_timestamp(),
             updated_at: sample_timestamp(),
             failure_reason: None,
+            scan_mode: ScanMode::Ssh,
         };
 
         let value = serde_json::to_value(&entry).unwrap();
 
         assert!(value["failure_reason"].is_null());
+        assert_eq!(value["scan_mode"], "ssh");
         assert!(value.get("result").is_none());
     }
 
