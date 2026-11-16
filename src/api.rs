@@ -83,8 +83,8 @@ use uuid::Uuid;
 
 use crate::audit::SCAN_REQUESTED_ACTION;
 use crate::domain::{
-    AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry, ScanStatus,
-    UserProfile,
+    AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry, ScanMode,
+    ScanStatus, UserProfile,
 };
 use crate::repository::{parse_target, RepoError, Repository};
 
@@ -310,6 +310,9 @@ async fn get_profile(
 #[derive(Debug, Deserialize)]
 struct CreateScanRequest {
     target: String,
+    /// Modo del escaneo (`ssh` por defecto); un valor desconocido se rechaza.
+    #[serde(default)]
+    scan_mode: ScanMode,
 }
 
 /// `POST /users/me/scans` — registra una nueva solicitud de escaneo (RF-13,
@@ -331,6 +334,7 @@ async fn create_scan(
         requested_at: now,
         updated_at: now,
         failure_reason: None,
+        scan_mode: payload.scan_mode,
     };
     let audit_entry = AuditEntry::new(
         Uuid::new_v4().to_string(),
