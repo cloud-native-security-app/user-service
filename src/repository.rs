@@ -38,8 +38,8 @@ use sqlx::PgPool;
 
 use crate::audit::{recorded_event, ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION};
 use crate::domain::{
-    AdminEmails, AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry,
-    ScanMode, ScanStatus, StoredScanResult, UserProfile,
+    AdminEmails, AuditEntry, NetworkCredential, NetworkScanEmails, ResolvedScanTarget, Role,
+    ScanHistoryEntry, ScanMode, ScanStatus, StoredScanResult, UserProfile,
 };
 use crate::security_events::{emit_all, NoopSecurityEventPublisher, SecurityEventPublisher};
 
@@ -56,6 +56,7 @@ pub struct Repository {
     pool: PgPool,
     encryption_key: SecretSlice<u8>,
     admin_emails: AdminEmails,
+    network_scan_emails: NetworkScanEmails,
     security_events: Arc<dyn SecurityEventPublisher>,
 }
 
@@ -68,6 +69,7 @@ impl Repository {
             pool,
             encryption_key,
             admin_emails: AdminEmails::default(),
+            network_scan_emails: NetworkScanEmails::default(),
             security_events: Arc::new(NoopSecurityEventPublisher),
         }
     }
@@ -78,6 +80,16 @@ impl Repository {
     /// administrador.
     pub fn with_admin_emails(mut self, admin_emails: AdminEmails) -> Self {
         self.admin_emails = admin_emails;
+        self
+    }
+
+    /// Fija la lista autoritativa de cuentas con permiso de escaneo en modo
+    /// red (`NETWORK_SCAN_EMAILS`) que usan
+    /// [`Repository::sync_network_scan_permissions`] y
+    /// [`Repository::reconcile_user_network_scan`]. Sin ella (por defecto)
+    /// nadie tiene el permiso.
+    pub fn with_network_scan_emails(mut self, network_scan_emails: NetworkScanEmails) -> Self {
+        self.network_scan_emails = network_scan_emails;
         self
     }
 
@@ -114,6 +126,44 @@ impl Repository {
     /// Ver [`Repository::sync_admin_roles`].
     pub async fn reconcile_user_role(&self, user_id: &str) -> Result<(), RepoError> {
         self.reconcile_roles(Some(user_id)).await.map(|_| ())
+    }
+
+    /// Reconcilia `can_network_scan` de **todos** los usuarios con
+    /// `NETWORK_SCAN_EMAILS`: concede a los listados y revoca al resto
+    /// (lista vacía = nadie). Idempotente: solo toca las filas que cambian.
+    /// Devuelve cuántas cambiaron. No escribe auditoría (el permiso no es un
+    /// rol; ver `docs/decisions.md`).
+    ///
+    /// # Errores
+    ///
+    /// [`RepoError`] si la consulta falla.
+    pub async fn sync_network_scan_permissions(&self) -> Result<u64, RepoError> {
+        self.reconcile_network_scan(None).await
+    }
+
+    /// Igual que [`Repository::sync_network_scan_permissions`], limitado a
+    /// `user_id`: se usa al aprovisionar el perfil para que un usuario listado
+    /// que inicia sesión por primera vez tenga el permiso de inmediato.
+    ///
+    /// # Errores
+    ///
+    /// Ver [`Repository::sync_network_scan_permissions`].
+    pub async fn reconcile_user_network_scan(&self, user_id: &str) -> Result<(), RepoError> {
+        self.reconcile_network_scan(Some(user_id)).await.map(|_| ())
+    }
+
+    async fn reconcile_network_scan(&self, only_user: Option<&str>) -> Result<u64, RepoError> {
+        let allowed = self.network_scan_emails.to_lowercase_vec();
+        let result = sqlx::query(
+            "UPDATE users SET can_network_scan = (lower(email) = ANY($1)) \
+             WHERE ($2::text IS NULL OR user_id = $2) \
+             AND can_network_scan <> (lower(email) = ANY($1))",
+        )
+        .bind(&allowed)
+        .bind(only_user)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Cambia el rol de los usuarios cuyo rol no coincide con la lista y
@@ -207,7 +257,8 @@ impl Repository {
     /// Devuelve [`RepoError`] si la consulta falla, nunca hace `panic!`.
     pub async fn find_user(&self, user_id: &str) -> Result<Option<UserProfile>, RepoError> {
         let row = sqlx::query_as::<_, UserRow>(
-            "SELECT user_id, email, display_name, role, created_at FROM users WHERE user_id = $1",
+            "SELECT user_id, email, display_name, role, can_network_scan, created_at \
+             FROM users WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -682,6 +733,7 @@ struct UserRow {
     email: String,
     display_name: String,
     role: String,
+    can_network_scan: bool,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -696,6 +748,7 @@ impl TryFrom<UserRow> for UserProfile {
             email: row.email,
             display_name: row.display_name,
             role: Role::from_db_str(&row.role).ok_or(RepoError::Backend)?,
+            can_network_scan: row.can_network_scan,
             created_at: row.created_at,
         })
     }

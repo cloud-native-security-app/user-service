@@ -115,6 +115,65 @@ impl fmt::Debug for AdminEmails {
     }
 }
 
+/// Lista autoritativa de correos autorizados a escanear en modo red
+/// (`NETWORK_SCAN_EMAILS`). Mismo formato y validación que [`AdminEmails`]:
+/// un usuario tiene el permiso si y solo si su correo está en la lista (sin
+/// distinguir mayúsculas). Los correos son datos personales: el `Debug` solo
+/// muestra la cantidad.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct NetworkScanEmails(AdminEmails);
+
+/// Error de [`NetworkScanEmails::parse`]. No incluye el valor rechazado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NetworkScanEmailsError {
+    /// Una entrada no tiene forma de correo electrónico.
+    #[error("una entrada de la lista de escaneo de red no es un correo válido")]
+    InvalidEntry,
+}
+
+impl NetworkScanEmails {
+    /// Parsea una lista separada por comas (ver [`AdminEmails::parse`]); una
+    /// lista vacía significa "nadie tiene el permiso".
+    ///
+    /// # Errores
+    ///
+    /// [`NetworkScanEmailsError::InvalidEntry`] si alguna entrada no vacía no
+    /// tiene forma de correo.
+    pub fn parse(raw: &str) -> Result<Self, NetworkScanEmailsError> {
+        AdminEmails::parse(raw)
+            .map(Self)
+            .map_err(|_| NetworkScanEmailsError::InvalidEntry)
+    }
+
+    /// Indica si `email` figura en la lista (sin distinguir mayúsculas).
+    pub fn contains(&self, email: &str) -> bool {
+        self.0.contains(email)
+    }
+
+    /// Cantidad de correos en la lista.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `true` si la lista está vacía (nadie tiene el permiso).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Correos en minúsculas, para pasarlos como parámetro de consulta.
+    pub fn to_lowercase_vec(&self) -> Vec<String> {
+        self.0.to_lowercase_vec()
+    }
+}
+
+impl fmt::Debug for NetworkScanEmails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetworkScanEmails")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
 /// Forma mínima de correo: un único `@`, parte local no vacía, dominio con al
 /// menos dos etiquetas no vacías y sin espacios.
 fn has_email_shape(value: &str) -> bool {
@@ -150,6 +209,13 @@ pub struct UserProfile {
     /// Rol del usuario. Lo lee el Gateway al iniciar sesión. Solo de salida:
     /// el repositorio nunca lo persiste desde un `UserProfile` recibido.
     pub role: Role,
+    /// Permiso para lanzar escaneos en modo red (`NETWORK_SCAN_EMAILS`). El
+    /// Gateway lo lee al iniciar sesión y lo revalida contra
+    /// `GET /users/me` en cada escaneo de red. Solo de salida, como `role`:
+    /// el repositorio nunca lo persiste desde un `UserProfile` recibido. Un
+    /// payload sin el campo (versión anterior) se interpreta como `false`.
+    #[serde(default)]
+    pub can_network_scan: bool,
     /// Marca de tiempo en la que se creó el perfil en `ms-usuarios`.
     pub created_at: DateTime<Utc>,
 }
@@ -396,6 +462,7 @@ mod tests {
             email: "test-user-1@example.test".to_string(),
             display_name: "Test User".to_string(),
             role: Role::Admin,
+            can_network_scan: false,
             created_at: sample_timestamp(),
         };
 
@@ -429,6 +496,7 @@ mod tests {
             email: "test-user-1@example.test".to_string(),
             display_name: "Test User".to_string(),
             role: Role::User,
+            can_network_scan: false,
             created_at: sample_timestamp(),
         };
 
@@ -484,6 +552,85 @@ mod tests {
         let debug = format!("{admins:?}");
 
         assert!(!debug.contains("admin-1"));
+    }
+
+    #[test]
+    fn network_scan_emails_parse_trims_lowercases_and_skips_empty_entries() {
+        let allowed = NetworkScanEmails::parse(" Ana@Example.test , ,bob@example.test,")
+            .expect("lista válida");
+
+        assert_eq!(allowed.len(), 2);
+        assert!(allowed.contains("ana@example.test"));
+        assert!(allowed.contains("BOB@EXAMPLE.TEST"));
+        assert!(!allowed.contains("eve@example.test"));
+        assert_eq!(
+            allowed.to_lowercase_vec(),
+            ["ana@example.test", "bob@example.test"]
+        );
+    }
+
+    #[test]
+    fn network_scan_emails_of_empty_input_means_nobody_is_allowed() {
+        for raw in ["", "   ", " , ,"] {
+            let allowed = NetworkScanEmails::parse(raw).expect("lista vacía válida");
+            assert!(allowed.is_empty());
+            assert!(!allowed.contains("anyone@example.test"));
+        }
+        assert!(NetworkScanEmails::default().is_empty());
+    }
+
+    #[test]
+    fn network_scan_emails_parse_rejects_entries_that_are_not_an_email_shape() {
+        for raw in [
+            "not-an-email",
+            "@example.test",
+            "user@nodot",
+            "ok@example.test,broken",
+        ] {
+            assert_eq!(
+                NetworkScanEmails::parse(raw),
+                Err(NetworkScanEmailsError::InvalidEntry),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_scan_emails_debug_never_prints_the_addresses() {
+        let allowed = NetworkScanEmails::parse("ana@example.test").expect("válida");
+
+        assert!(!format!("{allowed:?}").contains("ana"));
+    }
+
+    #[test]
+    fn user_profile_json_exposes_can_network_scan() {
+        let mut profile = UserProfile {
+            user_id: "u".to_string(),
+            email: "test-user-1@example.test".to_string(),
+            display_name: "Test User".to_string(),
+            role: Role::User,
+            can_network_scan: true,
+            created_at: sample_timestamp(),
+        };
+        assert_eq!(
+            serde_json::to_value(&profile).unwrap()["can_network_scan"],
+            true
+        );
+
+        profile.can_network_scan = false;
+        assert_eq!(
+            serde_json::to_value(&profile).unwrap()["can_network_scan"],
+            false
+        );
+    }
+
+    #[test]
+    fn user_profile_without_can_network_scan_deserializes_as_denied() {
+        let json = r#"{"user_id":"u","email":"a@b.test","display_name":"N","role":"user","created_at":"2026-09-18T12:00:00Z"}"#;
+
+        let profile: UserProfile = serde_json::from_str(json).expect("compatible");
+
+        assert!(!profile.can_network_scan);
     }
 
     #[test]

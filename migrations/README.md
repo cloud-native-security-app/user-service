@@ -30,6 +30,11 @@ Migraciones versionadas de `sqlx migrate` para `db-usuarios` (feature
   permisos nuevos (`ms_usuarios_app` ya tiene `SELECT/INSERT/UPDATE` sobre
   `users`); ninguna petición HTTP escribe `role`, solo la reconciliación con
   `ADMIN_BOOTSTRAP_EMAILS`.
+- `20261112140000_add_can_network_scan.sql`: feature `network_scan_permission`
+  (NS-07); `users` gana `can_network_scan BOOLEAN NOT NULL DEFAULT false`.
+  Aditiva: las filas existentes quedan en `false`. No concede permisos nuevos;
+  ninguna petición HTTP la escribe, solo la reconciliación con
+  `NETWORK_SCAN_EMAILS`.
 
 Recordatorio de convención (ver `docs/conventions.md`): una vez aplicada una
 migración en algún entorno, nunca se edita — un cambio de esquema es una

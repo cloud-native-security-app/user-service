@@ -29,8 +29,8 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 use user_service::domain::{
-    AdminEmails, AuditEntry, Role, ScanHistoryEntry, ScanMode, ScanStatus, StoredScanResult,
-    UserProfile,
+    AdminEmails, AuditEntry, NetworkScanEmails, Role, ScanHistoryEntry, ScanMode, ScanStatus,
+    StoredScanResult, UserProfile,
 };
 use user_service::repository::{parse_target, RepoError, Repository};
 use user_service::security_events::{
@@ -130,6 +130,7 @@ fn sample_profile(user_id: &str) -> UserProfile {
         email: format!("{user_id}@example.test"),
         display_name: "Test User".to_string(),
         role: Role::User,
+        can_network_scan: false,
         created_at: now_with_db_precision(),
     }
 }
@@ -1437,6 +1438,172 @@ async fn reconcile_user_role_only_touches_the_given_user() {
     assert_eq!(
         repo.find_user("rec-other").await.unwrap().unwrap().role,
         Role::User
+    );
+}
+
+fn repo_with_network_scan(db: &TestDb, emails: &str) -> Repository {
+    Repository::new(db.app_pool.clone(), test_encryption_key())
+        .with_network_scan_emails(NetworkScanEmails::parse(emails).expect("lista válida"))
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn new_profiles_cannot_network_scan_and_upsert_never_persists_the_flag() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let mut profile = sample_profile("ns-default");
+    profile.can_network_scan = true;
+
+    repo.upsert_user(&profile).await.expect("upsert");
+
+    let found = repo.find_user("ns-default").await.unwrap().unwrap();
+    assert!(!found.can_network_scan);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn sync_network_scan_grants_listed_users_case_insensitively_and_leaves_others_denied() {
+    let db = start_test_db().await;
+    let plain = Repository::new(db.app_pool.clone(), test_encryption_key());
+    for id in ["ns-listed", "ns-other"] {
+        plain
+            .upsert_user(&sample_profile(id))
+            .await
+            .expect("upsert");
+    }
+    let repo = repo_with_network_scan(&db, "NS-LISTED@Example.test");
+
+    let changed = repo.sync_network_scan_permissions().await.expect("sync");
+
+    assert_eq!(changed, 1);
+    assert!(
+        repo.find_user("ns-listed")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
+    );
+    assert!(
+        !repo
+            .find_user("ns-other")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn sync_network_scan_is_idempotent() {
+    let db = start_test_db().await;
+    let repo = repo_with_network_scan(&db, "ns-twice@example.test");
+    repo.upsert_user(&sample_profile("ns-twice"))
+        .await
+        .expect("upsert");
+
+    assert_eq!(repo.sync_network_scan_permissions().await.unwrap(), 1);
+    assert_eq!(repo.sync_network_scan_permissions().await.unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn sync_network_scan_revokes_users_that_left_the_list_and_empty_list_revokes_all() {
+    let db = start_test_db().await;
+    let granting = repo_with_network_scan(&db, "ns-a@example.test,ns-b@example.test");
+    for id in ["ns-a", "ns-b"] {
+        granting
+            .upsert_user(&sample_profile(id))
+            .await
+            .expect("upsert");
+    }
+    granting
+        .sync_network_scan_permissions()
+        .await
+        .expect("grant");
+
+    let narrowed = repo_with_network_scan(&db, "ns-a@example.test");
+    assert_eq!(narrowed.sync_network_scan_permissions().await.unwrap(), 1);
+    assert!(
+        narrowed
+            .find_user("ns-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
+    );
+    assert!(
+        !narrowed
+            .find_user("ns-b")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
+    );
+
+    let empty = repo_with_network_scan(&db, "");
+    assert_eq!(empty.sync_network_scan_permissions().await.unwrap(), 1);
+    assert!(
+        !empty
+            .find_user("ns-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn network_scan_and_admin_lists_are_independent() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key())
+        .with_admin_emails(AdminEmails::parse("ns-admin@example.test").unwrap())
+        .with_network_scan_emails(NetworkScanEmails::parse("ns-scanner@example.test").unwrap());
+    for id in ["ns-admin", "ns-scanner"] {
+        repo.upsert_user(&sample_profile(id)).await.expect("upsert");
+    }
+
+    repo.sync_admin_roles().await.expect("admins");
+    repo.sync_network_scan_permissions().await.expect("scan");
+
+    let admin = repo.find_user("ns-admin").await.unwrap().unwrap();
+    let scanner = repo.find_user("ns-scanner").await.unwrap().unwrap();
+    assert_eq!((admin.role, admin.can_network_scan), (Role::Admin, false));
+    assert_eq!((scanner.role, scanner.can_network_scan), (Role::User, true));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn reconcile_user_network_scan_only_touches_the_given_user() {
+    let db = start_test_db().await;
+    let plain = Repository::new(db.app_pool.clone(), test_encryption_key());
+    for id in ["ns-target", "ns-bystander"] {
+        plain
+            .upsert_user(&sample_profile(id))
+            .await
+            .expect("upsert");
+    }
+    let repo = repo_with_network_scan(&db, "ns-target@example.test,ns-bystander@example.test");
+
+    repo.reconcile_user_network_scan("ns-target")
+        .await
+        .expect("rec");
+
+    assert!(
+        repo.find_user("ns-target")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
+    );
+    assert!(
+        !repo
+            .find_user("ns-bystander")
+            .await
+            .unwrap()
+            .unwrap()
+            .can_network_scan
     );
 }
 

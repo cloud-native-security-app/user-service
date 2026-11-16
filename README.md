@@ -119,6 +119,7 @@ un error tipado explícito, nunca con un panic:
 | `GATEWAY_SHARED_SECRET` | Sí | Credencial compartida que autentica al Gateway como llamante de este servicio (ver `docs/security-scope.md`) |
 | `CREDENTIALS_ENCRYPTION_KEY` | Sí | Clave de cifrado en reposo (AES-256-GCM) de las credenciales SSH de red (feature `network_credentials_api`): 32 bytes codificados como hex de 64 caracteres. Tan sensible como `GATEWAY_SHARED_SECRET` — no debe commitearse ni loggearse (ver `docs/security-scope.md` §"Credenciales de red") |
 | `ADMIN_BOOTSTRAP_EMAILS` | No (ausente o vacía = sin administradores) | Correos de los administradores, separados por comas (se recortan espacios y no distingue mayúsculas). La lista es **autoritativa**: un usuario es `admin` si y solo si su correo está en ella. Se aplica (concede y revoca) al arrancar sobre los usuarios existentes y al aprovisionar el perfil (`PUT /users/me`). Una entrada que no sea un correo, o un valor que no sea UTF-8, impide el arranque. Cada cambio de rol queda en `audit_log` (`role.granted`/`role.revoked`) |
+| `NETWORK_SCAN_EMAILS` | No (ausente o vacía = nadie) | Correos de las cuentas autorizadas a lanzar escaneos en modo red (sin credenciales), separados por comas (se recortan espacios y no distingue mayúsculas). La lista es **autoritativa**: un usuario tiene `can_network_scan = true` si y solo si su correo está en ella; quitar un correo revoca el permiso. Se aplica al arrancar sobre los usuarios existentes y al aprovisionar el perfil (`PUT /users/me`), así que un correo aún no registrado lo recibe en su primer inicio de sesión. Mismas reglas de validación que `ADMIN_BOOTSTRAP_EMAILS` (una entrada inválida o un valor no UTF-8 impide el arranque). Es independiente del rol `admin`. No genera entradas de auditoría |
 | `SECURITY_EVENTS_STREAM_NAME` | No (ausente o en blanco = sin publicación) | Nombre del Kinesis Data Stream `security-events`. Si está definida, cada entrada que el servicio escribe en `audit_log` publica un evento `audit.recorded` (acción y tipo de recurso, `actor_sub` como clave de partición; nunca correo ni texto libre) **después** de confirmar la transacción. Un fallo de Kinesis solo se loggea y no altera ninguna respuesta ni la fila de auditoría. Un nombre que no sea `[a-zA-Z0-9_.-]` de hasta 128 caracteres impide el arranque. Requiere `kinesis:PutRecord` sobre el stream en el rol de la tarea |
 | `AWS_REGION` | No | Región del cliente Kinesis. Si falta, la resuelve la cadena por defecto de AWS. Las credenciales salen siempre de esa cadena (rol de la tarea ECS), nunca del código |
 | `AWS_ENDPOINT_URL` | No | Endpoint AWS alternativo, solo para LocalStack/desarrollo. Ausente en AWS real |
@@ -146,6 +147,7 @@ docker run --rm \
   -e GATEWAY_SHARED_SECRET=change-me \
   -e CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e ADMIN_BOOTSTRAP_EMAILS=admin@example.com \
+  -e NETWORK_SCAN_EMAILS=scanner@example.com \
   -p 8080:8080 \
   user-service:local
 ```
@@ -166,7 +168,7 @@ middleware interno antes de tocar la base de datos (ver
 | Método y ruta | Descripción |
 |---------------|-------------|
 | `PUT /users/me` | Crea o actualiza el perfil del llamante. Cuerpo: `{"display_name": "..."}`; cualquier otro campo (incluido `role`) se ignora |
-| `GET /users/me` | Perfil del llamante (`user_id`, `email`, `display_name`, `role`, `created_at`); `404` si aún no tiene perfil. `role` es `"user"` o `"admin"` y lo lee el Gateway al iniciar sesión; nunca se acepta desde el cuerpo de una petición |
+| `GET /users/me` | Perfil del llamante (`user_id`, `email`, `display_name`, `role`, `created_at`); `404` si aún no tiene perfil. `role` es `"user"` o `"admin"` y lo lee el Gateway al iniciar sesión; nunca se acepta desde el cuerpo de una petición. `can_network_scan` (booleano, `false` por defecto) indica si la cuenta puede lanzar escaneos en modo red; el Gateway lo lee al iniciar sesión y lo revalida con este mismo `GET /users/me` en cada escaneo de red; tampoco se acepta desde el cuerpo |
 | `POST /users/me/scans` | Registra una solicitud de escaneo (estado `Pendiente`) + su auditoría, en la misma transacción. Cuerpo: `{"target": "...", "scan_mode"?: "ssh"|"network"}`; `scan_mode` es opcional (por defecto `ssh`) y un valor desconocido se rechaza con `4xx` sin guardar nada. La respuesta incluye `scan_mode` |
 | `GET /users/me/scans` | Histórico de escaneos del llamante. Cada entrada incluye `scan_mode` (`ssh` o `network`; las filas anteriores son `ssh`) y `failure_reason` (`null` si no hay) y nunca el resultado completo. Estados: `PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO` |
 | `GET /users/me/scans/{scan_id}/report` | Resultado guardado de un escaneo propio (el JSON `ScanResult` tal cual). `404` si no existe o es de otro usuario, `409` si aún no está `COMPLETADO` con resultado |

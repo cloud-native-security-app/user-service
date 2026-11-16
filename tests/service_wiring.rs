@@ -75,11 +75,27 @@ async fn start_running_service() -> RunningService {
     start_running_service_with("", &[]).await
 }
 
+/// Igual que [`start_running_service_with`] pero con `NETWORK_SCAN_EMAILS`.
+async fn start_running_service_with_network_scan(
+    network_scan_emails: &str,
+    existing_users: &[(&str, &str)],
+) -> RunningService {
+    start_running_service_full("", network_scan_emails, existing_users).await
+}
+
 /// Igual que [`start_running_service`], con `ADMIN_BOOTSTRAP_EMAILS` y
 /// usuarios (`user_id`, `email`) ya existentes antes de arrancar, para
 /// verificar la reconciliación de roles durante el arranque.
 async fn start_running_service_with(
     admin_emails: &str,
+    existing_users: &[(&str, &str)],
+) -> RunningService {
+    start_running_service_full(admin_emails, "", existing_users).await
+}
+
+async fn start_running_service_full(
+    admin_emails: &str,
+    network_scan_emails: &str,
     existing_users: &[(&str, &str)],
 ) -> RunningService {
     let container = PostgresImage::default()
@@ -139,6 +155,8 @@ async fn start_running_service_with(
         migrations_database_url: superuser_url,
         admin_bootstrap_emails: user_service::domain::AdminEmails::parse(admin_emails)
             .expect("lista de administradores válida"),
+        network_scan_emails: user_service::domain::NetworkScanEmails::parse(network_scan_emails)
+            .expect("lista de escaneo de red válida"),
         security_events_stream_name: None,
         aws_region: None,
         aws_endpoint_url: None,
@@ -318,5 +336,37 @@ async fn startup_reconciles_existing_users_with_admin_bootstrap_emails() {
             .await
             .expect("JSON");
         assert_eq!(profile["role"], expected_role, "{user_id}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn startup_reconciles_existing_users_with_network_scan_emails() {
+    let service = start_running_service_with_network_scan(
+        "Seed-Ana@Example.test",
+        &[
+            ("seed-ana", "seed-ana@example.test"),
+            ("seed-bob", "seed-bob@example.test"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    for (user_id, email, expected) in [
+        ("seed-ana", "seed-ana@example.test", true),
+        ("seed-bob", "seed-bob@example.test", false),
+    ] {
+        let profile: Value = client
+            .get(format!("{}/users/me", service.base_url))
+            .header(GATEWAY_SECRET_HEADER, TEST_GATEWAY_SECRET)
+            .header(FORWARDED_USER_HEADER, identity_header(user_id, email))
+            .send()
+            .await
+            .expect("GET /users/me")
+            .json()
+            .await
+            .expect("JSON");
+        assert_eq!(profile["can_network_scan"], expected, "{user_id}");
+        assert_eq!(profile["role"], "user", "{user_id}");
     }
 }

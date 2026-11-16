@@ -84,6 +84,7 @@ async fn build_router_with_connect_timeout(
     let health_pool = database_pool.clone();
     let repository = Repository::new(database_pool, config.credentials_encryption_key.clone())
         .with_admin_emails(config.admin_bootstrap_emails.clone())
+        .with_network_scan_emails(config.network_scan_emails.clone())
         .with_security_events(build_security_event_publisher(config).await);
 
     // La lista es autoritativa: concede y revoca el rol de los usuarios que ya
@@ -94,6 +95,19 @@ async fn build_router_with_connect_timeout(
         WiringError::AdminBootstrapFailed
     })?;
     tracing::info!(changed, "roles de administrador reconciliados al arrancar");
+
+    // Igual para el permiso de escaneo en modo red: la lista es autoritativa.
+    let changed = repository
+        .sync_network_scan_permissions()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "no se pudo reconciliar el permiso de escaneo de red");
+            WiringError::NetworkScanBootstrapFailed
+        })?;
+    tracing::info!(
+        changed,
+        "permisos de escaneo de red reconciliados al arrancar"
+    );
 
     let api_router = api::router(repository, config.gateway_shared_secret.clone());
     let health_router = Router::new()
@@ -181,6 +195,10 @@ pub enum WiringError {
     /// `ADMIN_BOOTSTRAP_EMAILS`.
     #[error("fallo al reconciliar los roles de administrador")]
     AdminBootstrapFailed,
+    /// No se pudo reconciliar el permiso de escaneo de red con
+    /// `NETWORK_SCAN_EMAILS`.
+    #[error("fallo al reconciliar el permiso de escaneo de red")]
+    NetworkScanBootstrapFailed,
 }
 
 #[cfg(test)]
@@ -220,6 +238,7 @@ mod tests {
             credentials_encryption_key: SecretBox::from(vec![0x07u8; 32].into_boxed_slice()),
             migrations_database_url: UNREACHABLE_URL.to_string(),
             admin_bootstrap_emails: Default::default(),
+            network_scan_emails: Default::default(),
             security_events_stream_name: None,
             aws_region: None,
             aws_endpoint_url: None,
