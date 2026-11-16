@@ -29,7 +29,7 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 use user_service::domain::{
-    AdminEmails, AuditEntry, NetworkScanEmails, Role, ScanHistoryEntry, ScanStatus,
+    AdminEmails, AuditEntry, NetworkScanEmails, Role, ScanHistoryEntry, ScanMode, ScanStatus,
     StoredScanResult, UserProfile,
 };
 use user_service::repository::{parse_target, RepoError, Repository};
@@ -145,6 +145,7 @@ fn sample_scan(scan_id: &str, user_id: &str, status: ScanStatus) -> ScanHistoryE
         requested_at: now,
         updated_at: now,
         failure_reason: None,
+        scan_mode: ScanMode::Ssh,
     }
 }
 
@@ -165,6 +166,81 @@ async fn upsert_user_then_find_returns_the_stored_profile() {
         .expect("find_user no debe fallar");
 
     assert_eq!(found, Some(profile));
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn scan_history_persists_and_returns_the_scan_mode() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let profile = sample_profile("mode-user");
+    repo.upsert_user(&profile).await.expect("upsert");
+    let mut network = sample_scan("scan-net", &profile.user_id, ScanStatus::Pendiente);
+    network.scan_mode = ScanMode::Network;
+    let ssh = sample_scan("scan-ssh", &profile.user_id, ScanStatus::Pendiente);
+
+    repo.insert_scan_history(&network).await.expect("insert");
+    let audit = AuditEntry::new(
+        "audit-mode",
+        &profile.user_id,
+        "192.0.2.10",
+        "scan_requested",
+        ssh.requested_at,
+    );
+    repo.record_scan_request(&ssh, &audit)
+        .await
+        .expect("record");
+
+    let history = repo
+        .list_scan_history(&profile.user_id)
+        .await
+        .expect("list");
+    let mode_of = |id: &str| history.iter().find(|e| e.scan_id == id).unwrap().scan_mode;
+    assert_eq!(mode_of("scan-net"), ScanMode::Network);
+    assert_eq!(mode_of("scan-ssh"), ScanMode::Ssh);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn scan_history_rows_inserted_without_scan_mode_default_to_ssh() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let profile = sample_profile("legacy-user");
+    repo.upsert_user(&profile).await.expect("upsert");
+
+    sqlx::query(
+        "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at) \
+         VALUES ('legacy', $1, '192.0.2.10', 'PENDIENTE', now(), now())",
+    )
+    .bind(&profile.user_id)
+    .execute(&db.app_pool)
+    .await
+    .expect("insert sin scan_mode");
+
+    let history = repo
+        .list_scan_history(&profile.user_id)
+        .await
+        .expect("list");
+    assert_eq!(history[0].scan_mode, ScanMode::Ssh);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn scan_history_rejects_an_unknown_scan_mode_at_the_database() {
+    let db = start_test_db().await;
+    let repo = Repository::new(db.app_pool.clone(), test_encryption_key());
+    let profile = sample_profile("check-user");
+    repo.upsert_user(&profile).await.expect("upsert");
+
+    let result = sqlx::query(
+        "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at, scan_mode) \
+         VALUES ('bad', $1, '192.0.2.10', 'PENDIENTE', now(), now(), 'telnet')",
+    )
+    .bind(&profile.user_id)
+    .execute(&db.app_pool)
+    .await;
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]

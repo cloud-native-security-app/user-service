@@ -39,7 +39,7 @@ use sqlx::PgPool;
 use crate::audit::{recorded_event, ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION};
 use crate::domain::{
     AdminEmails, AuditEntry, NetworkCredential, NetworkScanEmails, ResolvedScanTarget, Role,
-    ScanHistoryEntry, ScanStatus, StoredScanResult, UserProfile,
+    ScanHistoryEntry, ScanMode, ScanStatus, StoredScanResult, UserProfile,
 };
 use crate::security_events::{emit_all, NoopSecurityEventPublisher, SecurityEventPublisher};
 
@@ -276,8 +276,8 @@ impl Repository {
     /// hacia `users`). Nunca hace `panic!`.
     pub async fn insert_scan_history(&self, entry: &ScanHistoryEntry) -> Result<(), RepoError> {
         sqlx::query(
-            "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at, scan_mode) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&entry.scan_id)
         .bind(&entry.user_id)
@@ -285,6 +285,7 @@ impl Repository {
         .bind(status_as_db_str(entry.status))
         .bind(entry.requested_at)
         .bind(entry.updated_at)
+        .bind(entry.scan_mode.as_db_str())
         .execute(&self.pool)
         .await?;
 
@@ -427,7 +428,7 @@ impl Repository {
         user_id: &str,
     ) -> Result<Vec<ScanHistoryEntry>, RepoError> {
         let rows = sqlx::query_as::<_, ScanHistoryRow>(
-            "SELECT scan_id, user_id, target, status, requested_at, updated_at, failure_reason \
+            "SELECT scan_id, user_id, target, status, requested_at, updated_at, failure_reason, scan_mode \
              FROM scan_history WHERE user_id = $1 ORDER BY requested_at ASC",
         )
         .bind(user_id)
@@ -491,8 +492,8 @@ impl Repository {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO scan_history (scan_id, user_id, target, status, requested_at, updated_at, scan_mode) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&entry.scan_id)
         .bind(&entry.user_id)
@@ -500,6 +501,7 @@ impl Repository {
         .bind(status_as_db_str(entry.status))
         .bind(entry.requested_at)
         .bind(entry.updated_at)
+        .bind(entry.scan_mode.as_db_str())
         .execute(&mut *tx)
         .await?;
 
@@ -764,6 +766,7 @@ struct ScanHistoryRow {
     requested_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     failure_reason: Option<String>,
+    scan_mode: String,
 }
 
 impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
@@ -778,6 +781,7 @@ impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
             requested_at: row.requested_at,
             updated_at: row.updated_at,
             failure_reason: row.failure_reason,
+            scan_mode: ScanMode::from_db_str(&row.scan_mode).ok_or(RepoError::Backend)?,
         })
     }
 }

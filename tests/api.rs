@@ -630,6 +630,85 @@ async fn post_scan_creates_history_and_audit_entry_atomically() {
     assert_eq!(audit[0]["user_id"], "scan-owner");
 }
 
+async fn post_scan_body(router: &Router, user: &str, body: Value) -> Response {
+    let request = request_to_with_headers(
+        "POST",
+        "/users/me/scans",
+        Some(user),
+        Some(TEST_GATEWAY_SECRET),
+        Body::from(body.to_string()),
+    );
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("POST no debe fallar a nivel de transporte")
+}
+
+async fn history_of(router: &Router, user: &str) -> Value {
+    let request = request_to_with_headers(
+        "GET",
+        "/users/me/scans",
+        Some(user),
+        Some(TEST_GATEWAY_SECRET),
+        Body::empty(),
+    );
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("GET no debe fallar a nivel de transporte");
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn post_scan_stores_scan_mode_and_defaults_to_ssh() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    create_profile(&router, "mode-owner").await;
+
+    let default = post_scan_body(&router, "mode-owner", json!({"target": "192.0.2.1"})).await;
+    assert_eq!(default.status(), StatusCode::OK);
+    assert_eq!(body_json(default).await["scan_mode"], "ssh");
+
+    let network = post_scan_body(
+        &router,
+        "mode-owner",
+        json!({"target": "192.0.2.2", "scan_mode": "network"}),
+    )
+    .await;
+    assert_eq!(network.status(), StatusCode::OK);
+    let created = body_json(network).await;
+    assert_eq!(created["scan_mode"], "network");
+
+    let history = history_of(&router, "mode-owner").await;
+    let history = history.as_array().unwrap();
+    let mode_for =
+        |target: &str| history.iter().find(|e| e["target"] == target).unwrap()["scan_mode"].clone();
+    assert_eq!(mode_for("192.0.2.1"), "ssh");
+    assert_eq!(mode_for("192.0.2.2"), "network");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn post_scan_rejects_an_unknown_scan_mode_and_stores_nothing() {
+    let db = start_test_db().await;
+    let router = test_router(db.app_pool.clone());
+    create_profile(&router, "bad-mode").await;
+
+    let response = post_scan_body(
+        &router,
+        "bad-mode",
+        json!({"target": "192.0.2.3", "scan_mode": "telnet"}),
+    )
+    .await;
+
+    assert!(response.status().is_client_error());
+    assert_eq!(history_of(&router, "bad-mode").await, json!([]));
+}
+
 #[tokio::test]
 #[ignore = "requiere Docker"]
 async fn patch_scan_status_update_is_reflected_in_get_history() {
