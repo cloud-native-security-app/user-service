@@ -35,6 +35,9 @@ use sqlx::PgPool;
 use crate::api;
 use crate::config::Config;
 use crate::messaging::kinesis::KinesisSecurityEventPublisher;
+use crate::report_email::mailer::Mailer;
+use crate::report_email::service::RetryPolicy;
+use crate::report_email::smtp::SmtpMailer;
 use crate::repository::Repository;
 use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 
@@ -109,12 +112,35 @@ async fn build_router_with_connect_timeout(
         "permisos de escaneo de red reconciliados al arrancar"
     );
 
-    let api_router = api::router(repository, config.gateway_shared_secret.clone());
+    let api_router = api::router_with_report_email(
+        repository,
+        config.gateway_shared_secret.clone(),
+        Some((build_mailer(config), RetryPolicy::default())),
+    );
     let health_router = Router::new()
         .route("/health", get(health))
         .with_state(health_pool);
 
     Ok(health_router.merge(api_router))
+}
+
+/// Builds the SMTP mailer, or `None` (report email disabled) when `SMTP_HOST`
+/// is unset or the settings cannot build a transport. Opens no connection.
+fn build_mailer(config: &Config) -> Option<Arc<dyn Mailer>> {
+    let Some(settings) = &config.smtp else {
+        tracing::info!("report email disabled: SMTP_HOST is not set");
+        return None;
+    };
+    match SmtpMailer::new(settings) {
+        Ok(mailer) => {
+            tracing::info!(host = %settings.host, port = settings.port, "report email: sending through SMTP");
+            Some(Arc::new(mailer))
+        }
+        Err(_) => {
+            tracing::error!("report email disabled: the SMTP settings are not usable");
+            None
+        }
+    }
 }
 
 /// Elige el adaptador de eventos de seguridad según la configuración: Kinesis
@@ -242,6 +268,7 @@ mod tests {
             security_events_stream_name: None,
             aws_region: None,
             aws_endpoint_url: None,
+            smtp: None,
         };
 
         // Cota de seguridad ante cuelgues: con `acquire_timeout` de 1 s el
@@ -257,5 +284,36 @@ mod tests {
             result,
             Err(WiringError::MigrationsConnectionFailed)
         ));
+    }
+
+    fn config_with(extra: &'static [(&'static str, &'static str)]) -> Config {
+        Config::from_lookup(|name| {
+            let base = [
+                ("DATABASE_URL", "postgres://u:p@localhost/db"),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", "0"),
+                ("GATEWAY_SHARED_SECRET", "s"),
+                (
+                    "CREDENTIALS_ENCRYPTION_KEY",
+                    "0707070707070707070707070707070707070707070707070707070707070707",
+                ),
+            ];
+            base.iter()
+                .chain(extra.iter())
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        })
+        .expect("valid config")
+    }
+
+    #[test]
+    fn build_mailer_is_none_without_smtp_host_and_some_with_it() {
+        assert!(build_mailer(&config_with(&[])).is_none());
+        let with_smtp = config_with(&[
+            ("SMTP_HOST", "smtp.example.test"),
+            ("SMTP_USERNAME", "reports@example.test"),
+            ("SMTP_PASSWORD", "pw"),
+        ]);
+        assert!(build_mailer(&with_smtp).is_some());
     }
 }

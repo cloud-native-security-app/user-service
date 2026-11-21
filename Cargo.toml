@@ -23,6 +23,9 @@ rand = "0.8"
 # Puerto `SecurityEventPublisher` (`src/security_events.rs`, KAP-08): trait async
 # detrás de `Arc<dyn ...>`, igual que en gateway y nmap-service.
 async-trait = "0.1"
+# SMTP adapter of the `Mailer` port (`src/report_email/smtp.rs`, EM-02): STARTTLS
+# required, rustls only (no OpenSSL).
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 # Adaptador Kinesis (`src/messaging/kinesis.rs`, KAP-08). Se fija `1.125.0` (igual
 # que gateway y nmap-service): es el último lanzamiento que acepta el `aws-runtime`
 # 1.10.0 / `aws-smithy-runtime` 1.16.0 que esos servicios ya fijan. Credenciales:

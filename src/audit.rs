@@ -25,6 +25,14 @@ pub const ROLE_GRANTED_ACTION: &str = "role.granted";
 /// de la entrada es el rol resultante (`"user"`); no se registra el correo.
 pub const ROLE_REVOKED_ACTION: &str = "role.revoked";
 
+/// Audit action when the scan report email was sent. The entry `target` is the
+/// scan id; neither the recipient nor the body is recorded.
+pub const REPORT_EMAILED_ACTION: &str = "report.emailed";
+
+/// Audit action when the scan report email failed after every retry. The entry
+/// `target` is the scan id.
+pub const REPORT_EMAIL_FAILED_ACTION: &str = "report.email_failed";
+
 /// Traduce una entrada de `audit_log` ya confirmada al evento `audit.recorded`.
 ///
 /// Mapeo de acciones y tipos de recurso a slugs del contrato (cualquier otra

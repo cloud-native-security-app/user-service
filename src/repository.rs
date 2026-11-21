@@ -38,9 +38,11 @@ use sqlx::PgPool;
 
 use crate::audit::{recorded_event, ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION};
 use crate::domain::{
-    AdminEmails, AuditEntry, NetworkCredential, NetworkScanEmails, ResolvedScanTarget, Role,
-    ScanHistoryEntry, ScanMode, ScanStatus, StoredScanResult, UserProfile,
+    AdminEmails, AuditEntry, NetworkCredential, NetworkScanEmails, ReportEmailStatus,
+    ResolvedScanTarget, Role, ScanHistoryEntry, ScanMode, ScanStatus, StoredScanResult,
+    UserProfile,
 };
+use crate::report_email::service::{ClaimedReport, ReportEmailStore};
 use crate::security_events::{emit_all, NoopSecurityEventPublisher, SecurityEventPublisher};
 
 /// Longitud del nonce de AES-256-GCM (96 bits, el tamaño que exige la
@@ -428,7 +430,8 @@ impl Repository {
         user_id: &str,
     ) -> Result<Vec<ScanHistoryEntry>, RepoError> {
         let rows = sqlx::query_as::<_, ScanHistoryRow>(
-            "SELECT scan_id, user_id, target, status, requested_at, updated_at, failure_reason, scan_mode \
+            "SELECT scan_id, user_id, target, status, requested_at, updated_at, failure_reason, scan_mode, \
+             report_email_status, report_emailed_at \
              FROM scan_history WHERE user_id = $1 ORDER BY requested_at ASC",
         )
         .bind(user_id)
@@ -754,6 +757,78 @@ impl TryFrom<UserRow> for UserProfile {
     }
 }
 
+#[async_trait::async_trait]
+impl ReportEmailStore for Repository {
+    /// One `UPDATE ... WHERE report_email_status IS NULL` is the claim: of any
+    /// number of concurrent or redelivered calls, exactly one gets the row.
+    async fn claim(&self, scan_id: &str) -> Result<Option<ClaimedReport>, RepoError> {
+        type Claimed = (
+            String,
+            String,
+            String,
+            Option<serde_json::Value>,
+            chrono::DateTime<chrono::Utc>,
+        );
+        let row: Option<Claimed> = sqlx::query_as(
+            "UPDATE scan_history SET report_email_status = 'pending' \
+             WHERE scan_id = $1 AND status = 'COMPLETADO' AND report_email_status IS NULL \
+             RETURNING user_id, target, scan_mode, result, updated_at",
+        )
+        .bind(scan_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((user_id, target, scan_mode, result, finished_at)) = row else {
+            return Ok(None);
+        };
+        let mode = ScanMode::from_db_str(&scan_mode).ok_or(RepoError::Backend)?;
+        // The recipient is always the owner's account email, read from `users`.
+        let Some(owner) = self.find_user(&user_id).await? else {
+            self.finish(scan_id, ReportEmailStatus::Failed, chrono::Utc::now())
+                .await?;
+            return Err(RepoError::NotFound);
+        };
+        Ok(Some(ClaimedReport {
+            scan_id: scan_id.to_string(),
+            user_id,
+            recipient: owner.email,
+            target,
+            mode,
+            finished_at,
+            result,
+        }))
+    }
+
+    async fn finish(
+        &self,
+        scan_id: &str,
+        status: ReportEmailStatus,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), RepoError> {
+        sqlx::query(
+            "UPDATE scan_history SET report_email_status = $2::text, \
+             report_emailed_at = CASE WHEN $2::text = 'sent' THEN $3 ELSE NULL END \
+             WHERE scan_id = $1",
+        )
+        .bind(scan_id)
+        .bind(status.as_db_str())
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn audit(&self, user_id: &str, action: &str, scan_id: &str) -> Result<(), RepoError> {
+        let entry = AuditEntry::new(
+            uuid::Uuid::new_v4().to_string(),
+            user_id,
+            scan_id,
+            action,
+            chrono::Utc::now(),
+        );
+        self.append_audit_entry(&entry).await
+    }
+}
+
 /// Fila cruda de la tabla `scan_history`, mapeada a [`ScanHistoryEntry`] vía
 /// `TryFrom` (el estado se valida contra las variantes conocidas de
 /// [`ScanStatus`]).
@@ -767,6 +842,8 @@ struct ScanHistoryRow {
     updated_at: chrono::DateTime<chrono::Utc>,
     failure_reason: Option<String>,
     scan_mode: String,
+    report_email_status: Option<String>,
+    report_emailed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
@@ -782,6 +859,12 @@ impl TryFrom<ScanHistoryRow> for ScanHistoryEntry {
             updated_at: row.updated_at,
             failure_reason: row.failure_reason,
             scan_mode: ScanMode::from_db_str(&row.scan_mode).ok_or(RepoError::Backend)?,
+            report_email_status: row
+                .report_email_status
+                .as_deref()
+                .map(|value| ReportEmailStatus::from_db_str(value).ok_or(RepoError::Backend))
+                .transpose()?,
+            report_emailed_at: row.report_emailed_at,
         })
     }
 }
