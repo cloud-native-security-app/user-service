@@ -1,0 +1,53 @@
+---
+source: src/report_email/tests.rs
+expression: as_snapshot(&email)
+---
+SUBJECT: Informe de escaneo: <script>evil()</script> (2 hallazgos)
+
+FILENAME: reporte-escaneo-scan-123.json
+
+--- TEXT ---
+Informe de escaneo
+Objetivo: <script>evil()</script>
+Fecha: 2026-11-20 15:30 UTC
+Modo: SSH (con credenciales)
+
+Resumen: 2 hallazgos
+- Crítica: 0
+- Alta: 1
+- Media: 0
+- Baja: 1
+- Informativa: 0
+- Desconocida: 0
+
+Hallazgos principales:
+1. [Alta] <script>alert(1)</script> - <script>alert('xss')</script> & "quotes"
+2. [Baja] CVE-2024-0009 - <img src=x onerror=alert(1)>
+
+El informe completo va adjunto en formato JSON.
+
+--- HTML ---
+<!DOCTYPE html>
+<html lang="es">
+<body style="font-family: sans-serif;">
+<h1>Informe de escaneo</h1>
+<p><strong>Objetivo:</strong> &lt;script&gt;evil()&lt;/script&gt;<br>
+<strong>Fecha:</strong> 2026-11-20 15:30 UTC<br>
+<strong>Modo:</strong> SSH (con credenciales)</p>
+<h2>Resumen: 2 hallazgos</h2>
+<ul>
+<li>Crítica: 0</li>
+<li>Alta: 1</li>
+<li>Media: 0</li>
+<li>Baja: 1</li>
+<li>Informativa: 0</li>
+<li>Desconocida: 0</li>
+</ul>
+<h2>Hallazgos principales</h2>
+<ol>
+<li>[Alta] <strong>&lt;script&gt;alert(1)&lt;/script&gt;</strong> - &lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt; &amp; &quot;quotes&quot;</li>
+<li>[Baja] <strong>CVE-2024-0009</strong> - &lt;img src=x onerror=alert(1)&gt;</li>
+</ol>
+<p>El informe completo va adjunto en formato JSON.</p>
+</body>
+</html>

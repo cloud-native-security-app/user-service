@@ -1,0 +1,44 @@
+---
+source: src/report_email/tests.rs
+expression: as_snapshot(&email)
+---
+SUBJECT: Informe de escaneo: 10.0.0.5 (sin hallazgos)
+
+FILENAME: reporte-escaneo-scan-123.json
+
+--- TEXT ---
+Informe de escaneo
+Objetivo: 10.0.0.5
+Fecha: 2026-11-20 15:30 UTC
+Modo: SSH (con credenciales)
+
+Resumen: 0 hallazgos
+- Crítica: 0
+- Alta: 0
+- Media: 0
+- Baja: 0
+- Informativa: 0
+- Desconocida: 0
+
+El informe completo va adjunto en formato JSON.
+
+--- HTML ---
+<!DOCTYPE html>
+<html lang="es">
+<body style="font-family: sans-serif;">
+<h1>Informe de escaneo</h1>
+<p><strong>Objetivo:</strong> 10.0.0.5<br>
+<strong>Fecha:</strong> 2026-11-20 15:30 UTC<br>
+<strong>Modo:</strong> SSH (con credenciales)</p>
+<h2>Resumen: 0 hallazgos</h2>
+<ul>
+<li>Crítica: 0</li>
+<li>Alta: 0</li>
+<li>Media: 0</li>
+<li>Baja: 0</li>
+<li>Informativa: 0</li>
+<li>Desconocida: 0</li>
+</ul>
+<p>El informe completo va adjunto en formato JSON.</p>
+</body>
+</html>

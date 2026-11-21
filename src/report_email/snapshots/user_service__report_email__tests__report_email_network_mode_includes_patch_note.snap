@@ -1,0 +1,54 @@
+---
+source: src/report_email/tests.rs
+expression: as_snapshot(&email)
+---
+SUBJECT: Informe de escaneo: 10.0.0.5 (1 hallazgo)
+
+FILENAME: reporte-escaneo-scan-123.json
+
+--- TEXT ---
+Informe de escaneo
+Objetivo: 10.0.0.5
+Fecha: 2026-11-20 15:30 UTC
+Modo: Red (solo IP)
+
+Estado de parches no verificado: este escaneo se hizo solo con la IP, sin credenciales SSH. Los hallazgos se basan en la versión de los servicios y pueden incluir vulnerabilidades ya corregidas.
+
+Resumen: 1 hallazgo
+- Crítica: 0
+- Alta: 1
+- Media: 0
+- Baja: 0
+- Informativa: 0
+- Desconocida: 0
+
+Hallazgos principales:
+1. [Alta] CVE-2024-0002 - High finding
+
+El informe completo va adjunto en formato JSON.
+
+--- HTML ---
+<!DOCTYPE html>
+<html lang="es">
+<body style="font-family: sans-serif;">
+<h1>Informe de escaneo</h1>
+<p><strong>Objetivo:</strong> 10.0.0.5<br>
+<strong>Fecha:</strong> 2026-11-20 15:30 UTC<br>
+<strong>Modo:</strong> Red (solo IP)</p>
+<p><em>Estado de parches no verificado: este escaneo se hizo solo con la IP, sin credenciales SSH. Los hallazgos se basan en la versión de los servicios y pueden incluir vulnerabilidades ya corregidas.</em></p>
+<h2>Resumen: 1 hallazgo</h2>
+<ul>
+<li>Crítica: 0</li>
+<li>Alta: 1</li>
+<li>Media: 0</li>
+<li>Baja: 0</li>
+<li>Informativa: 0</li>
+<li>Desconocida: 0</li>
+</ul>
+<h2>Hallazgos principales</h2>
+<ol>
+<li>[Alta] <strong>CVE-2024-0002</strong> - High finding</li>
+</ol>
+<p>El informe completo va adjunto en formato JSON.</p>
+</body>
+</html>
