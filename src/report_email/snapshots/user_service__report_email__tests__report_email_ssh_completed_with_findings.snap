@@ -1,0 +1,57 @@
+---
+source: src/report_email/tests.rs
+expression: as_snapshot(&email)
+---
+SUBJECT: Informe de escaneo: 10.0.0.5 (4 hallazgos)
+
+FILENAME: reporte-escaneo-scan-123.json
+
+--- TEXT ---
+Informe de escaneo
+Objetivo: 10.0.0.5
+Fecha: 2026-11-20 15:30 UTC
+Modo: SSH (con credenciales)
+
+Resumen: 4 hallazgos
+- Crítica: 1
+- Alta: 1
+- Media: 1
+- Baja: 1
+- Informativa: 0
+- Desconocida: 0
+
+Hallazgos principales:
+1. [Crítica] CVE-2024-0002 - Critical finding
+2. [Alta] CVE-2024-0004 - High finding
+3. [Media] CVE-2024-0001 - Medium finding
+4. [Baja] CVE-2024-0003 - Low finding
+
+El informe completo va adjunto en formato JSON.
+
+--- HTML ---
+<!DOCTYPE html>
+<html lang="es">
+<body style="font-family: sans-serif;">
+<h1>Informe de escaneo</h1>
+<p><strong>Objetivo:</strong> 10.0.0.5<br>
+<strong>Fecha:</strong> 2026-11-20 15:30 UTC<br>
+<strong>Modo:</strong> SSH (con credenciales)</p>
+<h2>Resumen: 4 hallazgos</h2>
+<ul>
+<li>Crítica: 1</li>
+<li>Alta: 1</li>
+<li>Media: 1</li>
+<li>Baja: 1</li>
+<li>Informativa: 0</li>
+<li>Desconocida: 0</li>
+</ul>
+<h2>Hallazgos principales</h2>
+<ol>
+<li>[Crítica] <strong>CVE-2024-0002</strong> - Critical finding</li>
+<li>[Alta] <strong>CVE-2024-0004</strong> - High finding</li>
+<li>[Media] <strong>CVE-2024-0001</strong> - Medium finding</li>
+<li>[Baja] <strong>CVE-2024-0003</strong> - Low finding</li>
+</ol>
+<p>El informe completo va adjunto en formato JSON.</p>
+</body>
+</html>

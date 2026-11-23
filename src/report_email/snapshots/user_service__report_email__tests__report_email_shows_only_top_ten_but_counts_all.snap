@@ -1,0 +1,71 @@
+---
+source: src/report_email/tests.rs
+expression: as_snapshot(&email)
+---
+SUBJECT: Informe de escaneo: 10.0.0.5 (12 hallazgos)
+
+FILENAME: reporte-escaneo-scan-123.json
+
+--- TEXT ---
+Informe de escaneo
+Objetivo: 10.0.0.5
+Fecha: 2026-11-20 15:30 UTC
+Modo: SSH (con credenciales)
+
+Resumen: 12 hallazgos
+- Crítica: 1
+- Alta: 1
+- Media: 2
+- Baja: 8
+- Informativa: 0
+- Desconocida: 0
+
+Hallazgos principales:
+1. [Crítica] CVE-2024-3000 - Critical finding
+2. [Alta] CVE-2024-3001 - High finding
+3. [Media] CVE-2024-2000 - Mid finding
+4. [Media] CVE-2024-2001 - Mid finding
+5. [Baja] CVE-2024-1000 - Low finding
+6. [Baja] CVE-2024-1001 - Low finding
+7. [Baja] CVE-2024-1002 - Low finding
+8. [Baja] CVE-2024-1003 - Low finding
+9. [Baja] CVE-2024-1004 - Low finding
+10. [Baja] CVE-2024-1005 - Low finding
+Se muestran los 10 hallazgos más severos.
+
+El informe completo va adjunto en formato JSON.
+
+--- HTML ---
+<!DOCTYPE html>
+<html lang="es">
+<body style="font-family: sans-serif;">
+<h1>Informe de escaneo</h1>
+<p><strong>Objetivo:</strong> 10.0.0.5<br>
+<strong>Fecha:</strong> 2026-11-20 15:30 UTC<br>
+<strong>Modo:</strong> SSH (con credenciales)</p>
+<h2>Resumen: 12 hallazgos</h2>
+<ul>
+<li>Crítica: 1</li>
+<li>Alta: 1</li>
+<li>Media: 2</li>
+<li>Baja: 8</li>
+<li>Informativa: 0</li>
+<li>Desconocida: 0</li>
+</ul>
+<h2>Hallazgos principales</h2>
+<ol>
+<li>[Crítica] <strong>CVE-2024-3000</strong> - Critical finding</li>
+<li>[Alta] <strong>CVE-2024-3001</strong> - High finding</li>
+<li>[Media] <strong>CVE-2024-2000</strong> - Mid finding</li>
+<li>[Media] <strong>CVE-2024-2001</strong> - Mid finding</li>
+<li>[Baja] <strong>CVE-2024-1000</strong> - Low finding</li>
+<li>[Baja] <strong>CVE-2024-1001</strong> - Low finding</li>
+<li>[Baja] <strong>CVE-2024-1002</strong> - Low finding</li>
+<li>[Baja] <strong>CVE-2024-1003</strong> - Low finding</li>
+<li>[Baja] <strong>CVE-2024-1004</strong> - Low finding</li>
+<li>[Baja] <strong>CVE-2024-1005</strong> - Low finding</li>
+</ol>
+<p>Se muestran los 10 hallazgos más severos.</p>
+<p>El informe completo va adjunto en formato JSON.</p>
+</body>
+</html>
