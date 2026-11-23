@@ -306,3 +306,10 @@ impl Summary<'_> {
 
 #[cfg(test)]
 mod tests;
+
+pub mod mailer;
+pub mod service;
+pub mod smtp;
+
+#[cfg(test)]
+mod service_tests;

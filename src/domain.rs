@@ -278,6 +278,46 @@ impl ScanMode {
     }
 }
 
+/// State of the report email of a completed scan (`scan_history.report_email_status`).
+///
+/// `None` in a [`ScanHistoryEntry`] means "no email attempted yet" (scan not
+/// completed, or completed before the feature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportEmailStatus {
+    /// The send was claimed and is in progress (or the process died mid-send).
+    Pending,
+    /// The email was delivered to the SMTP server.
+    Sent,
+    /// Every retry failed.
+    Failed,
+    /// SMTP is not configured, nothing was sent.
+    Disabled,
+}
+
+impl ReportEmailStatus {
+    /// `TEXT` stored in `scan_history.report_email_status`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ReportEmailStatus::Pending => "pending",
+            ReportEmailStatus::Sent => "sent",
+            ReportEmailStatus::Failed => "failed",
+            ReportEmailStatus::Disabled => "disabled",
+        }
+    }
+
+    /// Decodes the `TEXT` of `scan_history.report_email_status`.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(ReportEmailStatus::Pending),
+            "sent" => Some(ReportEmailStatus::Sent),
+            "failed" => Some(ReportEmailStatus::Failed),
+            "disabled" => Some(ReportEmailStatus::Disabled),
+            _ => None,
+        }
+    }
+}
+
 /// Entrada del histórico de escaneos solicitados por un usuario (RF-13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanHistoryEntry {
@@ -301,6 +341,13 @@ pub struct ScanHistoryEntry {
     /// leen como `ssh`.
     #[serde(default)]
     pub scan_mode: ScanMode,
+    /// State of the report email (`null` until a completed scan claims it).
+    #[serde(default)]
+    pub report_email_status: Option<ReportEmailStatus>,
+    /// When the report email was sent (`null` unless `report_email_status`
+    /// is `sent`).
+    #[serde(default)]
+    pub report_emailed_at: Option<DateTime<Utc>>,
 }
 
 /// Estado y resultado almacenado de un escaneo, tal como lo lee el endpoint
@@ -644,6 +691,8 @@ mod tests {
             updated_at: sample_timestamp(),
             failure_reason: Some("host inalcanzable".to_string()),
             scan_mode: ScanMode::Network,
+            report_email_status: None,
+            report_emailed_at: None,
         };
 
         let json = serde_json::to_string(&entry).expect("serializa");
@@ -740,6 +789,8 @@ mod tests {
             updated_at: sample_timestamp(),
             failure_reason: None,
             scan_mode: ScanMode::Ssh,
+            report_email_status: None,
+            report_emailed_at: None,
         };
 
         let value = serde_json::to_value(&entry).unwrap();

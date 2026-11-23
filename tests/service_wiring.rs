@@ -160,6 +160,7 @@ async fn start_running_service_full(
         security_events_stream_name: None,
         aws_region: None,
         aws_endpoint_url: None,
+        smtp: None,
     };
 
     let app = wiring::build_router(&config)

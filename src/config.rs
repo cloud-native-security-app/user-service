@@ -13,6 +13,7 @@ use std::fmt;
 use secrecy::{SecretBox, SecretSlice, SecretString};
 
 use crate::domain::{AdminEmails, NetworkScanEmails};
+use crate::report_email::smtp::{SmtpSettings, SmtpTls};
 
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
@@ -61,6 +62,20 @@ pub const AWS_REGION_VAR: &str = "AWS_REGION";
 /// Nombre de la variable de entorno, **opcional**, con el endpoint AWS
 /// alternativo (solo LocalStack/desarrollo). Ausente en AWS real.
 pub const AWS_ENDPOINT_URL_VAR: &str = "AWS_ENDPOINT_URL";
+
+/// Optional SMTP host of the report email. Unset or blank disables the email.
+pub const SMTP_HOST_VAR: &str = "SMTP_HOST";
+/// Optional SMTP port (default 587).
+pub const SMTP_PORT_VAR: &str = "SMTP_PORT";
+/// Optional SMTP login user.
+pub const SMTP_USERNAME_VAR: &str = "SMTP_USERNAME";
+/// Optional SMTP login password (secret).
+pub const SMTP_PASSWORD_VAR: &str = "SMTP_PASSWORD";
+/// Optional sender address (defaults to `SMTP_USERNAME`).
+pub const SMTP_FROM_VAR: &str = "SMTP_FROM";
+/// Optional transport security: `starttls` (default, required) or `none`
+/// (plain, no login; only for a local test sink such as Mailpit).
+pub const SMTP_TLS_VAR: &str = "SMTP_TLS";
 
 /// Largo máximo de un nombre de stream de Kinesis.
 const MAX_STREAM_NAME_CHARS: usize = 128;
@@ -120,6 +135,9 @@ pub struct Config {
     /// Endpoint AWS alternativo (solo LocalStack), si se indicó. Ver
     /// [`AWS_ENDPOINT_URL_VAR`].
     pub aws_endpoint_url: Option<String>,
+    /// SMTP settings of the report email; `None` (no `SMTP_HOST`) disables it.
+    /// The password is redacted in `Debug`.
+    pub smtp: Option<SmtpSettings>,
 }
 
 impl fmt::Debug for Config {
@@ -147,6 +165,7 @@ impl fmt::Debug for Config {
             )
             .field("aws_region", &self.aws_region)
             .field("aws_endpoint_url", &self.aws_endpoint_url)
+            .field("smtp", &self.smtp)
             .finish()
     }
 }
@@ -208,6 +227,8 @@ impl Config {
         let aws_region = read_optional(&lookup, AWS_REGION_VAR);
         let aws_endpoint_url = read_optional(&lookup, AWS_ENDPOINT_URL_VAR);
 
+        let smtp = read_smtp(&lookup)?;
+
         let http_port = raw_http_port
             .parse::<u16>()
             .map_err(|_| ConfigError::InvalidPort {
@@ -226,6 +247,7 @@ impl Config {
             security_events_stream_name,
             aws_region,
             aws_endpoint_url,
+            smtp,
         })
     }
 }
@@ -249,6 +271,47 @@ fn decode_encryption_key(value: &str) -> Result<SecretSlice<u8>, ConfigError> {
         });
     }
     Ok(SecretBox::from(bytes.into_boxed_slice()))
+}
+
+/// Reads the `SMTP_*` variables: no `SMTP_HOST` means the email is disabled.
+/// Fails closed on an invalid port, TLS mode or sender, on a user without
+/// password (or the reverse), and on a missing sender; errors name the
+/// variable, never the value.
+fn read_smtp(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<SmtpSettings>, ConfigError> {
+    let invalid = |variable| ConfigError::InvalidSmtp { variable };
+    let Some(host) = read_optional(lookup, SMTP_HOST_VAR) else {
+        return Ok(None);
+    };
+    let port = match read_optional(lookup, SMTP_PORT_VAR) {
+        None => 587,
+        Some(raw) => raw.parse::<u16>().map_err(|_| invalid(SMTP_PORT_VAR))?,
+    };
+    let tls = match read_optional(lookup, SMTP_TLS_VAR).as_deref() {
+        None | Some("starttls") => SmtpTls::StartTls,
+        Some("none") => SmtpTls::None,
+        Some(_) => return Err(invalid(SMTP_TLS_VAR)),
+    };
+    let username = read_optional(lookup, SMTP_USERNAME_VAR);
+    let password = read_optional(lookup, SMTP_PASSWORD_VAR).map(SecretString::from);
+    if username.is_some() != password.is_some() {
+        return Err(invalid(SMTP_PASSWORD_VAR));
+    }
+    let from = read_optional(lookup, SMTP_FROM_VAR)
+        .or_else(|| username.clone())
+        .ok_or_else(|| invalid(SMTP_FROM_VAR))?;
+    if from.parse::<lettre::message::Mailbox>().is_err() {
+        return Err(invalid(SMTP_FROM_VAR));
+    }
+    Ok(Some(SmtpSettings {
+        host,
+        port,
+        username,
+        password,
+        from,
+        tls,
+    }))
 }
 
 /// Lee `ADMIN_BOOTSTRAP_EMAILS`: ausente = sin administradores. Un valor que
@@ -377,6 +440,13 @@ pub enum ConfigError {
     #[error("la variable de entorno {variable} contiene una entrada que no es un correo válido")]
     InvalidAdminEmails {
         /// Nombre de la variable de entorno con el valor inválido.
+        variable: &'static str,
+    },
+    /// An `SMTP_*` variable is invalid or the set is incomplete. Names the
+    /// variable only: the values include a password.
+    #[error("the environment variable {variable} is invalid or incomplete for the SMTP settings")]
+    InvalidSmtp {
+        /// Name of the offending variable.
         variable: &'static str,
     },
     /// Alguna entrada de `NETWORK_SCAN_EMAILS` no es un correo válido. No
@@ -804,5 +874,76 @@ mod tests {
         let config = env.load().expect("config válida");
         assert_eq!(config.aws_region, None);
         assert_eq!(config.aws_endpoint_url, None);
+    }
+
+    fn smtp_env() -> FakeEnv {
+        let mut env = FakeEnv::valid();
+        env.set("SMTP_HOST", "smtp.gmail.com");
+        env.set("SMTP_USERNAME", "reports@example.test");
+        env.set("SMTP_PASSWORD", "app-password-value");
+        env
+    }
+
+    #[test]
+    fn smtp_is_disabled_when_the_host_is_unset_or_blank() {
+        assert!(FakeEnv::valid().load().unwrap().smtp.is_none());
+        let mut env = smtp_env();
+        env.set("SMTP_HOST", "  ");
+        assert!(env.load().unwrap().smtp.is_none());
+    }
+
+    #[test]
+    fn smtp_defaults_to_port_587_required_starttls_and_the_username_as_sender() {
+        let smtp = smtp_env().load().unwrap().smtp.expect("smtp configured");
+        assert_eq!(smtp.host, "smtp.gmail.com");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(smtp.tls, crate::report_email::smtp::SmtpTls::StartTls);
+        assert_eq!(smtp.from, "reports@example.test");
+        assert_eq!(smtp.username.as_deref(), Some("reports@example.test"));
+        assert_eq!(
+            smtp.password.as_ref().unwrap().expose_secret(),
+            "app-password-value"
+        );
+    }
+
+    #[test]
+    fn smtp_from_overrides_the_username_and_port_and_tls_none_are_explicit() {
+        let mut env = FakeEnv::valid();
+        env.set("SMTP_HOST", "mailpit");
+        env.set("SMTP_PORT", "1025");
+        env.set("SMTP_TLS", "none");
+        env.set("SMTP_FROM", "noreply@example.test");
+        let smtp = env.load().unwrap().smtp.expect("smtp configured");
+        assert_eq!(smtp.port, 1025);
+        assert_eq!(smtp.tls, crate::report_email::smtp::SmtpTls::None);
+        assert_eq!(smtp.from, "noreply@example.test");
+        assert!(smtp.username.is_none() && smtp.password.is_none());
+    }
+
+    #[test]
+    fn invalid_smtp_settings_fail_without_echoing_values() {
+        for (name, value) in [
+            ("SMTP_PORT", "not-a-port"),
+            ("SMTP_TLS", "opportunistic"),
+            ("SMTP_FROM", "not an address"),
+        ] {
+            let mut env = smtp_env();
+            env.set(name, value);
+            let err = env.load().expect_err("must fail closed");
+            assert!(!err.to_string().contains(value), "{err}");
+        }
+        // Password without user, or neither user nor from: incomplete.
+        let mut env = smtp_env();
+        env.remove("SMTP_USERNAME");
+        assert!(env.load().is_err());
+        let mut env = FakeEnv::valid();
+        env.set("SMTP_HOST", "mailpit");
+        assert!(env.load().is_err(), "no sender address");
+    }
+
+    #[test]
+    fn config_debug_never_contains_the_smtp_password() {
+        let debug = format!("{:?}", smtp_env().load().unwrap());
+        assert!(!debug.contains("app-password-value"));
     }
 }

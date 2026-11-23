@@ -146,6 +146,8 @@ fn sample_scan(scan_id: &str, user_id: &str, status: ScanStatus) -> ScanHistoryE
         updated_at: now,
         failure_reason: None,
         scan_mode: ScanMode::Ssh,
+        report_email_status: None,
+        report_emailed_at: None,
     }
 }
 

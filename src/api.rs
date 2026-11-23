@@ -86,6 +86,8 @@ use crate::domain::{
     AuditEntry, NetworkCredential, ResolvedScanTarget, Role, ScanHistoryEntry, ScanMode,
     ScanStatus, UserProfile,
 };
+use crate::report_email::mailer::Mailer;
+use crate::report_email::service::{ReportEmailService, RetryPolicy};
 use crate::repository::{parse_target, RepoError, Repository};
 
 /// Largo máximo (en caracteres) de `failure_reason`.
@@ -112,6 +114,9 @@ pub const FORWARDED_USER_HEADER: &str = "X-Forwarded-User";
 struct AppState {
     repository: Arc<Repository>,
     gateway_shared_secret: Arc<SecretString>,
+    /// Sends the report email when a scan completes; `None` skips it entirely
+    /// (no claim, no status), which is what plain [`router`] does.
+    report_email: Option<Arc<ReportEmailService>>,
 }
 
 /// Construye el router `axum` del perfil de usuario.
@@ -123,9 +128,26 @@ struct AppState {
 /// anidar bajo un router mayor) desde la composition root del servicio
 /// (feature `service_wiring`).
 pub fn router(repository: Repository, gateway_shared_secret: SecretString) -> Router {
+    router_with_report_email(repository, gateway_shared_secret, None)
+}
+
+/// Same as [`router`], plus the report email flow: when a `PATCH /scans/{id}`
+/// stores `COMPLETADO`, `report_email` sends the report in the background.
+/// `report_email` is `None` to skip the flow, or `Some(mailer)` where a `None`
+/// mailer means SMTP is not configured (scans are marked `disabled`).
+pub fn router_with_report_email(
+    repository: Repository,
+    gateway_shared_secret: SecretString,
+    report_email: Option<(Option<Arc<dyn Mailer>>, RetryPolicy)>,
+) -> Router {
+    let repository = Arc::new(repository);
+    let report_email = report_email.map(|(mailer, retry)| {
+        Arc::new(ReportEmailService::new(repository.clone(), mailer, retry))
+    });
     let state = AppState {
-        repository: Arc::new(repository),
+        repository,
         gateway_shared_secret: Arc::new(gateway_shared_secret),
+        report_email,
     };
 
     Router::new()
@@ -344,6 +366,8 @@ async fn create_scan(
         updated_at: now,
         failure_reason: None,
         scan_mode: payload.scan_mode,
+        report_email_status: None,
+        report_emailed_at: None,
     };
     let audit_entry = AuditEntry::new(
         Uuid::new_v4().to_string(),
@@ -464,7 +488,16 @@ async fn patch_scan_status(
         )
         .await
     {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Ok(()) => {
+            // Fire and forget: the claim makes a redelivered outcome a no-op,
+            // and nothing here can fail or delay the update.
+            if payload.status == ScanStatus::Completado {
+                if let Some(report_email) = &state.report_email {
+                    report_email.spawn_for_completed(scan_id);
+                }
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(RepoError::NotFound) => Err(ApiError::NotFound),
         Err(other) => Err(ApiError::from(other)),
     }
