@@ -28,6 +28,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -36,7 +37,9 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::PgPool;
 
-use crate::audit::{recorded_event, ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION};
+use crate::audit::{
+    recorded_event, REPORT_EMAIL_FAILED_ACTION, ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION,
+};
 use crate::domain::{
     AdminEmails, AuditEntry, NetworkCredential, NetworkScanEmails, ReportEmailStatus,
     ResolvedScanTarget, Role, ScanHistoryEntry, ScanMode, ScanStatus, StoredScanResult,
@@ -762,40 +765,67 @@ impl ReportEmailStore for Repository {
     /// One `UPDATE ... WHERE report_email_status IS NULL` is the claim: of any
     /// number of concurrent or redelivered calls, exactly one gets the row.
     async fn claim(&self, scan_id: &str) -> Result<Option<ClaimedReport>, RepoError> {
-        type Claimed = (
-            String,
-            String,
-            String,
-            Option<serde_json::Value>,
-            chrono::DateTime<chrono::Utc>,
-        );
-        let row: Option<Claimed> = sqlx::query_as(
-            "UPDATE scan_history SET report_email_status = 'pending' \
+        let row: Option<ClaimedRow> = sqlx::query_as(
+            "UPDATE scan_history SET report_email_status = 'pending', \
+             report_email_claimed_at = now() \
              WHERE scan_id = $1 AND status = 'COMPLETADO' AND report_email_status IS NULL \
-             RETURNING user_id, target, scan_mode, result, updated_at",
+             RETURNING scan_id, user_id, target, scan_mode, result, updated_at",
         )
         .bind(scan_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((user_id, target, scan_mode, result, finished_at)) = row else {
-            return Ok(None);
-        };
-        let mode = ScanMode::from_db_str(&scan_mode).ok_or(RepoError::Backend)?;
-        // The recipient is always the owner's account email, read from `users`.
-        let Some(owner) = self.find_user(&user_id).await? else {
-            self.finish(scan_id, ReportEmailStatus::Failed, chrono::Utc::now())
-                .await?;
-            return Err(RepoError::NotFound);
-        };
-        Ok(Some(ClaimedReport {
-            scan_id: scan_id.to_string(),
-            user_id,
-            recipient: owner.email,
-            target,
-            mode,
-            finished_at,
-            result,
-        }))
+        match row {
+            Some(row) => self.claimed_report(row).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Re-claims up to `limit` `pending` rows whose claim is older than
+    /// `older_than`. `FOR UPDATE SKIP LOCKED` plus the refreshed
+    /// `report_email_claimed_at` make it atomic: a concurrent tick or instance
+    /// either skips the locked rows or no longer sees them as stale.
+    async fn reclaim_stale(
+        &self,
+        older_than: Duration,
+        limit: u32,
+    ) -> Result<Vec<ClaimedReport>, RepoError> {
+        let rows: Vec<ClaimedRow> = sqlx::query_as(
+            "UPDATE scan_history SET report_email_claimed_at = now() \
+             WHERE scan_id IN ( \
+                 SELECT scan_id FROM scan_history \
+                 WHERE status = 'COMPLETADO' AND report_email_status = 'pending' \
+                   AND COALESCE(report_email_claimed_at, updated_at) \
+                       < now() - make_interval(secs => $1) \
+                 ORDER BY COALESCE(report_email_claimed_at, updated_at) \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED) \
+               AND report_email_status = 'pending' \
+             RETURNING scan_id, user_id, target, scan_mode, result, updated_at",
+        )
+        .bind(older_than.as_secs_f64())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            match self.claimed_report(row).await {
+                Ok(report) => claimed.push(report),
+                // Unrecoverable rows were already stored `failed`; transient errors
+                // leave the row `pending` for a later tick. Keep the batch going.
+                Err(error) => tracing::error!(%error, "report email reaper: skipped a scan"),
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn touch(&self, scan_ids: &[String]) -> Result<(), RepoError> {
+        sqlx::query(
+            "UPDATE scan_history SET report_email_claimed_at = now() \
+             WHERE scan_id = ANY($1) AND report_email_status = 'pending'",
+        )
+        .bind(scan_ids)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn finish(
@@ -826,6 +856,70 @@ impl ReportEmailStore for Repository {
             chrono::Utc::now(),
         );
         self.append_audit_entry(&entry).await
+    }
+}
+
+/// Columns the report email claim returns.
+type ClaimedRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<serde_json::Value>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+impl Repository {
+    /// Builds the [`ClaimedReport`] of a claimed row. The recipient is always
+    /// the owner's account email, read from `users`.
+    ///
+    /// Unrecoverable data errors (an unreadable stored `scan_mode`, a missing
+    /// owner) mark the row `failed` and audit it, so the reaper never picks it
+    /// up again. A transient database error is returned with the row still
+    /// `pending`: the reaper retries it after the threshold, and each failure is
+    /// logged by the caller.
+    async fn claimed_report(&self, row: ClaimedRow) -> Result<ClaimedReport, RepoError> {
+        let (scan_id, user_id, target, scan_mode, result, finished_at) = row;
+        let Some(mode) = ScanMode::from_db_str(&scan_mode) else {
+            return self
+                .fail_unrecoverable(&scan_id, &user_id, RepoError::Backend)
+                .await;
+        };
+        let Some(owner) = self.find_user(&user_id).await? else {
+            return self
+                .fail_unrecoverable(&scan_id, &user_id, RepoError::NotFound)
+                .await;
+        };
+        Ok(ClaimedReport {
+            scan_id,
+            user_id,
+            recipient: owner.email,
+            target,
+            mode,
+            finished_at,
+            result,
+        })
+    }
+}
+
+impl Repository {
+    /// Stores `failed` and the failure audit entry for a claimed report whose
+    /// data can never be sent, then returns `error`.
+    async fn fail_unrecoverable(
+        &self,
+        scan_id: &str,
+        user_id: &str,
+        error: RepoError,
+    ) -> Result<ClaimedReport, RepoError> {
+        self.finish(scan_id, ReportEmailStatus::Failed, chrono::Utc::now())
+            .await?;
+        self.audit(user_id, REPORT_EMAIL_FAILED_ACTION, scan_id)
+            .await?;
+        tracing::error!(
+            scan_id,
+            "report email: unreadable stored data, marked failed"
+        );
+        Err(error)
     }
 }
 

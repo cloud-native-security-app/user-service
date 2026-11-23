@@ -9,10 +9,12 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::time::Duration;
 
 use secrecy::{SecretBox, SecretSlice, SecretString};
 
 use crate::domain::{AdminEmails, NetworkScanEmails};
+use crate::report_email::service::{ReaperPolicy, MIN_REAPER_AFTER};
 use crate::report_email::smtp::{SmtpSettings, SmtpTls};
 
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
@@ -62,6 +64,12 @@ pub const AWS_REGION_VAR: &str = "AWS_REGION";
 /// Nombre de la variable de entorno, **opcional**, con el endpoint AWS
 /// alternativo (solo LocalStack/desarrollo). Ausente en AWS real.
 pub const AWS_ENDPOINT_URL_VAR: &str = "AWS_ENDPOINT_URL";
+
+/// Optional seconds a report email may stay `pending` before the reaper
+/// retries it (default 600).
+pub const REPORT_EMAIL_REAPER_AFTER_SECS_VAR: &str = "REPORT_EMAIL_REAPER_AFTER_SECS";
+/// Optional seconds between reaper ticks (default 60).
+pub const REPORT_EMAIL_REAPER_INTERVAL_SECS_VAR: &str = "REPORT_EMAIL_REAPER_INTERVAL_SECS";
 
 /// Optional SMTP host of the report email. Unset or blank disables the email.
 pub const SMTP_HOST_VAR: &str = "SMTP_HOST";
@@ -138,6 +146,9 @@ pub struct Config {
     /// SMTP settings of the report email; `None` (no `SMTP_HOST`) disables it.
     /// The password is redacted in `Debug`.
     pub smtp: Option<SmtpSettings>,
+    /// Threshold, interval and batch of the reaper that retries report emails
+    /// stuck in `pending`. Only used when SMTP is configured.
+    pub report_email_reaper: ReaperPolicy,
 }
 
 impl fmt::Debug for Config {
@@ -166,6 +177,7 @@ impl fmt::Debug for Config {
             .field("aws_region", &self.aws_region)
             .field("aws_endpoint_url", &self.aws_endpoint_url)
             .field("smtp", &self.smtp)
+            .field("report_email_reaper", &self.report_email_reaper)
             .finish()
     }
 }
@@ -228,6 +240,7 @@ impl Config {
         let aws_endpoint_url = read_optional(&lookup, AWS_ENDPOINT_URL_VAR);
 
         let smtp = read_smtp(&lookup)?;
+        let report_email_reaper = read_reaper(&lookup)?;
 
         let http_port = raw_http_port
             .parse::<u16>()
@@ -248,6 +261,7 @@ impl Config {
             aws_region,
             aws_endpoint_url,
             smtp,
+            report_email_reaper,
         })
     }
 }
@@ -312,6 +326,32 @@ fn read_smtp(
         from,
         tls,
     }))
+}
+
+/// Reads the reaper durations (whole seconds; the interval at least 1, the
+/// threshold at least [`MIN_REAPER_AFTER`]). Errors name the
+/// variable only.
+fn read_reaper(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ReaperPolicy, ConfigError> {
+    let defaults = ReaperPolicy::default();
+    let seconds = |variable: &'static str, default: Duration| match read_optional(lookup, variable)
+    {
+        None => Ok(default),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs >= 1 => Ok(Duration::from_secs(secs)),
+            _ => Err(ConfigError::InvalidReportEmailReaper { variable }),
+        },
+    };
+    let after = seconds(REPORT_EMAIL_REAPER_AFTER_SECS_VAR, defaults.after)?;
+    if after < MIN_REAPER_AFTER {
+        return Err(ConfigError::InvalidReportEmailReaper {
+            variable: REPORT_EMAIL_REAPER_AFTER_SECS_VAR,
+        });
+    }
+    Ok(ReaperPolicy {
+        after,
+        interval: seconds(REPORT_EMAIL_REAPER_INTERVAL_SECS_VAR, defaults.interval)?,
+        batch: defaults.batch,
+    })
 }
 
 /// Lee `ADMIN_BOOTSTRAP_EMAILS`: ausente = sin administradores. Un valor que
@@ -446,6 +486,15 @@ pub enum ConfigError {
     /// variable only: the values include a password.
     #[error("the environment variable {variable} is invalid or incomplete for the SMTP settings")]
     InvalidSmtp {
+        /// Name of the offending variable.
+        variable: &'static str,
+    },
+    /// A report email reaper variable is not a whole number of seconds >= 1.
+    #[error(
+        "the environment variable {variable} must be a whole number of seconds, at least 1 \
+         (REPORT_EMAIL_REAPER_AFTER_SECS: at least 120)"
+    )]
+    InvalidReportEmailReaper {
         /// Name of the offending variable.
         variable: &'static str,
     },
@@ -945,5 +994,53 @@ mod tests {
     fn config_debug_never_contains_the_smtp_password() {
         let debug = format!("{:?}", smtp_env().load().unwrap());
         assert!(!debug.contains("app-password-value"));
+    }
+
+    #[test]
+    fn the_report_email_reaper_defaults_to_ten_minutes_checked_every_minute() {
+        let reaper = FakeEnv::valid().load().unwrap().report_email_reaper;
+        assert_eq!(reaper.after, Duration::from_secs(600));
+        assert_eq!(reaper.interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_report_email_reaper_reads_both_durations_in_seconds() {
+        let mut env = FakeEnv::valid();
+        env.set("REPORT_EMAIL_REAPER_AFTER_SECS", "120");
+        env.set("REPORT_EMAIL_REAPER_INTERVAL_SECS", "5");
+        let reaper = env.load().unwrap().report_email_reaper;
+        assert_eq!(reaper.after, Duration::from_secs(120));
+        assert_eq!(reaper.interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_invalid_reaper_duration_fails_naming_only_the_variable() {
+        for (variable, value) in [
+            ("REPORT_EMAIL_REAPER_AFTER_SECS", "soon"),
+            ("REPORT_EMAIL_REAPER_AFTER_SECS", "0"),
+            ("REPORT_EMAIL_REAPER_INTERVAL_SECS", "-3"),
+            ("REPORT_EMAIL_REAPER_INTERVAL_SECS", "0"),
+        ] {
+            let mut env = FakeEnv::valid();
+            env.set(variable, value);
+            let error = env.load().unwrap_err();
+            assert!(error.to_string().contains(variable), "{error}");
+            assert!(
+                !error.to_string().contains(value) || value == "0",
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reaper_threshold_below_the_minimum_is_refused() {
+        let mut env = FakeEnv::valid();
+        env.set("REPORT_EMAIL_REAPER_AFTER_SECS", "119");
+        let error = env.load().unwrap_err();
+        assert!(
+            error.to_string().contains("REPORT_EMAIL_REAPER_AFTER_SECS"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("120"), "{error}");
     }
 }
