@@ -309,6 +309,9 @@ fn read_smtp(
     };
     let username = read_optional(lookup, SMTP_USERNAME_VAR);
     let password = read_optional(lookup, SMTP_PASSWORD_VAR).map(SecretString::from);
+    if tls == SmtpTls::None && (username.is_some() || password.is_some()) {
+        return Err(ConfigError::InsecureSmtpCredentials);
+    }
     if username.is_some() != password.is_some() {
         return Err(invalid(SMTP_PASSWORD_VAR));
     }
@@ -489,6 +492,13 @@ pub enum ConfigError {
         /// Name of the offending variable.
         variable: &'static str,
     },
+    /// SMTP credentials with `SMTP_TLS=none` would travel in plain text.
+    /// Names the variables only, never their values.
+    #[error(
+        "SMTP_TLS=none sends in plain text, so SMTP_USERNAME and SMTP_PASSWORD must not be set \
+         with it: use SMTP_TLS=starttls or remove the credentials"
+    )]
+    InsecureSmtpCredentials,
     /// A report email reaper variable is not a whole number of seconds >= 1.
     #[error(
         "the environment variable {variable} must be a whole number of seconds, at least 1 \
@@ -988,6 +998,53 @@ mod tests {
         let mut env = FakeEnv::valid();
         env.set("SMTP_HOST", "mailpit");
         assert!(env.load().is_err(), "no sender address");
+    }
+
+    #[test]
+    fn smtp_tls_none_with_credentials_is_refused_naming_the_variables_not_the_values() {
+        let cases: [&[(&'static str, &'static str)]; 3] = [
+            &[
+                ("SMTP_USERNAME", "reports@example.test"),
+                ("SMTP_PASSWORD", "plain-secret-pw"),
+            ],
+            &[("SMTP_USERNAME", "reports@example.test")],
+            &[("SMTP_PASSWORD", "plain-secret-pw")],
+        ];
+        for creds in cases {
+            let mut env = FakeEnv::valid();
+            env.set("SMTP_HOST", "mailpit");
+            env.set("SMTP_TLS", "none");
+            env.set("SMTP_FROM", "noreply@example.test");
+            for (name, value) in creds {
+                env.set(name, *value);
+            }
+            let err = env.load().expect_err("credentials over plain text");
+            assert!(matches!(err, ConfigError::InsecureSmtpCredentials), "{err}");
+            let text = err.to_string();
+            for named in ["SMTP_TLS", "SMTP_USERNAME", "SMTP_PASSWORD"] {
+                assert!(text.contains(named), "{text}");
+            }
+            assert!(!text.contains("plain-secret-pw") && !text.contains("reports@example.test"));
+        }
+    }
+
+    #[test]
+    fn smtp_credentials_stay_valid_with_starttls_and_mailpit_without_them_stays_valid() {
+        for tls in [None, Some("starttls")] {
+            let mut env = smtp_env();
+            if let Some(tls) = tls {
+                env.set("SMTP_TLS", tls);
+            }
+            assert!(env.load().unwrap().smtp.is_some());
+        }
+        let mut env = FakeEnv::valid();
+        env.set("SMTP_HOST", "mailpit");
+        env.set("SMTP_TLS", "none");
+        env.set("SMTP_FROM", "noreply@example.test");
+        // Blank credentials count as unset.
+        env.set("SMTP_USERNAME", " ");
+        env.set("SMTP_PASSWORD", "");
+        assert!(env.load().unwrap().smtp.is_some());
     }
 
     #[test]
