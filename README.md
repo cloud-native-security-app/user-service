@@ -126,6 +126,8 @@ un error tipado explícito, nunca con un panic:
 | `SMTP_USERNAME` / `SMTP_PASSWORD` | No (van juntas) | Credenciales SMTP. La contraseña es un secreto: se redacta en `Debug` y nunca se loggea |
 | `SMTP_FROM` | No (por defecto `SMTP_USERNAME`) | Dirección remitente. Sin `SMTP_USERNAME` es obligatoria |
 | `SMTP_TLS` | No (`starttls`) | `starttls` exige STARTTLS (un servidor sin él se rechaza); `none` = texto plano sin login, solo para el sumidero Mailpit de pruebas |
+| `REPORT_EMAIL_REAPER_AFTER_SECS` | No (600) | Segundos que un correo de informe puede quedar `pending` antes de que el reaper lo reintente (un envío perdido por un apagado o un fallo del proceso). Entero >= 1. Solo actúa con `SMTP_HOST` definido |
+| `REPORT_EMAIL_REAPER_INTERVAL_SECS` | No (60) | Segundos entre pasadas del reaper (hasta 20 informes por pasada). Entero >= 1. El reintento usa la misma ruta que el envío normal y deja `sent` o `failed`; la reclamación es atómica, así que varias instancias no envían dos veces |
 | `AWS_REGION` | No | Región del cliente Kinesis. Si falta, la resuelve la cadena por defecto de AWS. Las credenciales salen siempre de esa cadena (rol de la tarea ECS), nunca del código |
 | `AWS_ENDPOINT_URL` | No | Endpoint AWS alternativo, solo para LocalStack/desarrollo. Ausente en AWS real |
 | `MIGRATIONS_DATABASE_URL` | No (cae de vuelta a `DATABASE_URL` si está ausente) | URL de conexión usada **exclusivamente** para aplicar las migraciones al arrancar, con el rol "dueño" de las tablas |

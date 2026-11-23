@@ -44,6 +44,15 @@ pub trait ReportEmailStore: Send + Sync {
     /// `None` when the scan is not `COMPLETADO` or the email was already claimed.
     async fn claim(&self, scan_id: &str) -> Result<Option<ClaimedReport>, RepoError>;
 
+    /// Atomically re-claims up to `limit` reports left `pending` for longer than
+    /// `older_than` (a send lost to a shutdown or crash), refreshing their claim
+    /// time so no other caller gets them.
+    async fn reclaim_stale(
+        &self,
+        older_than: Duration,
+        limit: u32,
+    ) -> Result<Vec<ClaimedReport>, RepoError>;
+
     /// Stores the final status; `at` becomes `report_emailed_at` for `sent`.
     async fn finish(
         &self,
@@ -70,6 +79,27 @@ impl Default for RetryPolicy {
         Self {
             attempts: 3,
             backoff: Duration::from_secs(2),
+        }
+    }
+}
+
+/// When the reaper looks for reports stuck in `pending`, and how many it takes.
+#[derive(Debug, Clone, Copy)]
+pub struct ReaperPolicy {
+    /// A `pending` report is stuck once its claim is older than this.
+    pub after: Duration,
+    /// Time between reaper ticks.
+    pub interval: Duration,
+    /// Maximum reports re-claimed per tick.
+    pub batch: u32,
+}
+
+impl Default for ReaperPolicy {
+    fn default() -> Self {
+        Self {
+            after: Duration::from_secs(600),
+            interval: Duration::from_secs(60),
+            batch: 20,
         }
     }
 }
@@ -113,7 +143,50 @@ impl ReportEmailService {
                 return;
             }
         };
+        self.send_claimed(job).await;
+    }
 
+    /// Starts the periodic reaper in the background (see [`Self::reap_once`]).
+    /// Does nothing when SMTP is not configured: there is nothing to retry.
+    pub fn spawn_reaper(self: &Arc<Self>, policy: ReaperPolicy) {
+        if self.mailer.is_none() {
+            return;
+        }
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(policy.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                service.reap_once(&policy).await;
+            }
+        });
+    }
+
+    /// One reaper tick: re-claims up to `policy.batch` reports stuck in
+    /// `pending` for longer than `policy.after` and sends them through the same
+    /// path as the first attempt. Returns how many it took. Never fails:
+    /// errors are logged.
+    pub async fn reap_once(&self, policy: &ReaperPolicy) -> usize {
+        let jobs = match self.store.reclaim_stale(policy.after, policy.batch).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::error!(%error, "report email reaper: could not re-claim stuck reports");
+                return 0;
+            }
+        };
+        let count = jobs.len();
+        for job in jobs {
+            tracing::warn!(scan_id = %job.scan_id, "report email reaper: retrying a stuck send");
+            self.send_claimed(job).await;
+        }
+        count
+    }
+
+    /// Renders and sends a report this process holds the claim of, then stores
+    /// `sent`, `failed` or `disabled` and audits it.
+    async fn send_claimed(&self, job: ClaimedReport) {
+        let scan_id = job.scan_id.as_str();
         let Some(mailer) = &self.mailer else {
             tracing::info!(scan_id, "report email disabled: SMTP is not configured");
             self.finish(&job, ReportEmailStatus::Disabled).await;

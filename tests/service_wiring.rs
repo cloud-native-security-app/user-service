@@ -161,6 +161,7 @@ async fn start_running_service_full(
         aws_region: None,
         aws_endpoint_url: None,
         smtp: None,
+        report_email_reaper: Default::default(),
     };
 
     let app = wiring::build_router(&config)

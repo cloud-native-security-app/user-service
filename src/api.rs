@@ -140,7 +140,17 @@ pub fn router_with_report_email(
     gateway_shared_secret: SecretString,
     report_email: Option<(Option<Arc<dyn Mailer>>, RetryPolicy)>,
 ) -> Router {
-    let repository = Arc::new(repository);
+    router_with_shared_repository(Arc::new(repository), gateway_shared_secret, report_email)
+}
+
+/// Same as [`router_with_report_email`] for a repository the caller also
+/// shares with another component (the composition root shares it with the
+/// report email reaper).
+pub fn router_with_shared_repository(
+    repository: Arc<Repository>,
+    gateway_shared_secret: SecretString,
+    report_email: Option<(Option<Arc<dyn Mailer>>, RetryPolicy)>,
+) -> Router {
     let report_email = report_email.map(|(mailer, retry)| {
         Arc::new(ReportEmailService::new(repository.clone(), mailer, retry))
     });

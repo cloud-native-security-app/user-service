@@ -36,7 +36,7 @@ use crate::api;
 use crate::config::Config;
 use crate::messaging::kinesis::KinesisSecurityEventPublisher;
 use crate::report_email::mailer::Mailer;
-use crate::report_email::service::RetryPolicy;
+use crate::report_email::service::{ReportEmailService, RetryPolicy};
 use crate::report_email::smtp::SmtpMailer;
 use crate::repository::Repository;
 use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
@@ -112,10 +112,21 @@ async fn build_router_with_connect_timeout(
         "permisos de escaneo de red reconciliados al arrancar"
     );
 
-    let api_router = api::router_with_report_email(
+    let repository = Arc::new(repository);
+    let mailer = build_mailer(config);
+    // The reaper retries sends lost to a shutdown or crash; it only runs when
+    // email is enabled (it never starts without a mailer).
+    let reaper = Arc::new(ReportEmailService::new(
+        repository.clone(),
+        mailer.clone(),
+        RetryPolicy::default(),
+    ));
+    reaper.spawn_reaper(config.report_email_reaper);
+
+    let api_router = api::router_with_shared_repository(
         repository,
         config.gateway_shared_secret.clone(),
-        Some((build_mailer(config), RetryPolicy::default())),
+        Some((mailer, RetryPolicy::default())),
     );
     let health_router = Router::new()
         .route("/health", get(health))
@@ -269,6 +280,7 @@ mod tests {
             aws_region: None,
             aws_endpoint_url: None,
             smtp: None,
+            report_email_reaper: Default::default(),
         };
 
         // Cota de seguridad ante cuelgues: con `acquire_timeout` de 1 s el

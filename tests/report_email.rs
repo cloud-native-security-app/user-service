@@ -20,7 +20,9 @@ use user_service::domain::{
     ReportEmailStatus, Role, ScanHistoryEntry, ScanMode, ScanStatus, UserProfile,
 };
 use user_service::report_email::mailer::{Mailer, MailerError, OutgoingEmail};
-use user_service::report_email::service::{ReportEmailService, ReportEmailStore, RetryPolicy};
+use user_service::report_email::service::{
+    ReaperPolicy, ReportEmailService, ReportEmailStore, RetryPolicy,
+};
 use user_service::report_email::smtp::{SmtpMailer, SmtpSettings, SmtpTls};
 use user_service::report_email::ReportAttachment;
 use user_service::repository::Repository;
@@ -376,4 +378,153 @@ async fn patching_a_scan_to_completed_returns_at_once_and_emails_in_the_backgrou
     let history: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(history[0]["report_email_status"], "sent");
     assert!(history[0]["report_emailed_at"].is_string());
+}
+
+/// Leaves the scan `pending` since `age`, as if the process died mid-send.
+async fn strand_pending(pool: &PgPool, scan_id: &str, age: &str) {
+    sqlx::query(
+        "UPDATE scan_history SET report_email_status = 'pending', \
+         report_email_claimed_at = now() - $2::interval WHERE scan_id = $1",
+    )
+    .bind(scan_id)
+    .bind(age)
+    .execute(pool)
+    .await
+    .expect("strand");
+}
+
+async fn mailpit_service(repo: &Arc<Repository>, mailpit: &Mailpit) -> Arc<ReportEmailService> {
+    let mailer: Arc<dyn Mailer> =
+        Arc::new(SmtpMailer::new(&mailpit.settings(SmtpTls::None)).expect("mailer"));
+    Arc::new(ReportEmailService::new(
+        repo.clone(),
+        Some(mailer),
+        RetryPolicy::default(),
+    ))
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn the_reaper_sends_a_pending_report_older_than_the_threshold_and_marks_it_sent() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+
+    let processed = mailpit_service(&repo, &mailpit)
+        .await
+        .reap_once(&ReaperPolicy::default())
+        .await;
+
+    assert_eq!(processed, 1);
+    let messages = mailpit.messages().await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["To"][0]["Address"], "owner@example.test");
+    let entry = history_entry(&repo).await;
+    assert_eq!(entry.report_email_status, Some(ReportEmailStatus::Sent));
+    assert!(entry.report_emailed_at.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn the_reaper_also_takes_a_legacy_pending_row_without_a_claim_time() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    sqlx::query(
+        "UPDATE scan_history SET report_email_status = 'pending', \
+         report_email_claimed_at = NULL, updated_at = now() - interval '1 hour'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("legacy row");
+
+    mailpit_service(&repo, &mailpit)
+        .await
+        .reap_once(&ReaperPolicy::default())
+        .await;
+
+    assert_eq!(mailpit.messages().await.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn the_reaper_leaves_a_fresh_pending_report_alone() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+
+    let processed = mailpit_service(&repo, &mailpit)
+        .await
+        .reap_once(&ReaperPolicy::default())
+        .await;
+
+    assert_eq!(processed, 0);
+    assert!(mailpit.messages().await.is_empty());
+    assert_eq!(
+        history_entry(&repo).await.report_email_status,
+        Some(ReportEmailStatus::Pending)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn two_concurrent_reaper_ticks_send_the_report_once() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+    let service = mailpit_service(&repo, &mailpit).await;
+    let policy = ReaperPolicy::default();
+
+    let (a, b) = tokio::join!(service.reap_once(&policy), service.reap_once(&policy));
+
+    assert_eq!(a + b, 1, "exactly one tick takes the row");
+    assert_eq!(mailpit.messages().await.len(), 1);
+    assert_eq!(
+        history_entry(&repo).await.report_email_status,
+        Some(ReportEmailStatus::Sent)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn the_reaper_marks_failed_a_stale_report_whose_send_fails() {
+    let db = start_db().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+    // Nothing listens on this port: every attempt is a transport failure.
+    let settings = SmtpSettings {
+        host: "127.0.0.1".into(),
+        port: 1,
+        username: None,
+        password: None,
+        from: "reports@example.test".into(),
+        tls: SmtpTls::None,
+    };
+    let mailer: Arc<dyn Mailer> = Arc::new(SmtpMailer::new(&settings).expect("mailer"));
+    let service = ReportEmailService::new(
+        repo.clone(),
+        Some(mailer),
+        RetryPolicy {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+    );
+
+    service.reap_once(&ReaperPolicy::default()).await;
+
+    assert_eq!(
+        history_entry(&repo).await.report_email_status,
+        Some(ReportEmailStatus::Failed)
+    );
 }
