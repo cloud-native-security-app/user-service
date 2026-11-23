@@ -14,7 +14,7 @@ use std::time::Duration;
 use secrecy::{SecretBox, SecretSlice, SecretString};
 
 use crate::domain::{AdminEmails, NetworkScanEmails};
-use crate::report_email::service::ReaperPolicy;
+use crate::report_email::service::{ReaperPolicy, MIN_REAPER_AFTER};
 use crate::report_email::smtp::{SmtpSettings, SmtpTls};
 
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
@@ -328,7 +328,8 @@ fn read_smtp(
     }))
 }
 
-/// Reads the reaper durations (whole seconds, at least 1). Errors name the
+/// Reads the reaper durations (whole seconds; the interval at least 1, the
+/// threshold at least [`MIN_REAPER_AFTER`]). Errors name the
 /// variable only.
 fn read_reaper(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ReaperPolicy, ConfigError> {
     let defaults = ReaperPolicy::default();
@@ -340,8 +341,14 @@ fn read_reaper(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ReaperPolic
             _ => Err(ConfigError::InvalidReportEmailReaper { variable }),
         },
     };
+    let after = seconds(REPORT_EMAIL_REAPER_AFTER_SECS_VAR, defaults.after)?;
+    if after < MIN_REAPER_AFTER {
+        return Err(ConfigError::InvalidReportEmailReaper {
+            variable: REPORT_EMAIL_REAPER_AFTER_SECS_VAR,
+        });
+    }
     Ok(ReaperPolicy {
-        after: seconds(REPORT_EMAIL_REAPER_AFTER_SECS_VAR, defaults.after)?,
+        after,
         interval: seconds(REPORT_EMAIL_REAPER_INTERVAL_SECS_VAR, defaults.interval)?,
         batch: defaults.batch,
     })
@@ -483,7 +490,10 @@ pub enum ConfigError {
         variable: &'static str,
     },
     /// A report email reaper variable is not a whole number of seconds >= 1.
-    #[error("the environment variable {variable} must be a whole number of seconds, at least 1")]
+    #[error(
+        "the environment variable {variable} must be a whole number of seconds, at least 1 \
+         (REPORT_EMAIL_REAPER_AFTER_SECS: at least 120)"
+    )]
     InvalidReportEmailReaper {
         /// Name of the offending variable.
         variable: &'static str,
@@ -1020,5 +1030,17 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn a_reaper_threshold_below_the_minimum_is_refused() {
+        let mut env = FakeEnv::valid();
+        env.set("REPORT_EMAIL_REAPER_AFTER_SECS", "119");
+        let error = env.load().unwrap_err();
+        assert!(
+            error.to_string().contains("REPORT_EMAIL_REAPER_AFTER_SECS"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("120"), "{error}");
     }
 }

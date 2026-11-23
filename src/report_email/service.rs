@@ -53,6 +53,10 @@ pub trait ReportEmailStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ClaimedReport>, RepoError>;
 
+    /// Heartbeat: refreshes the claim time of those of `scan_ids` still `pending`,
+    /// so a report this process is still sending is never judged stale.
+    async fn touch(&self, scan_ids: &[String]) -> Result<(), RepoError>;
+
     /// Stores the final status; `at` becomes `report_emailed_at` for `sent`.
     async fn finish(
         &self,
@@ -83,12 +87,22 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Smallest accepted `ReaperPolicy::after`. The heartbeat refreshes the claim
+/// before every send attempt, so a live sender is stale only if one attempt
+/// outlasts `after`. One SMTP attempt is bounded by a 20 s timeout per network
+/// operation; 120 s leaves a wide margin over it.
+pub const MIN_REAPER_AFTER: Duration = Duration::from_secs(120);
+
+/// Shortest period the reaper ticks at: a zero interval would panic the timer.
+const MIN_REAPER_INTERVAL: Duration = Duration::from_secs(1);
+
 /// When the reaper looks for reports stuck in `pending`, and how many it takes.
 #[derive(Debug, Clone, Copy)]
 pub struct ReaperPolicy {
-    /// A `pending` report is stuck once its claim is older than this.
+    /// A `pending` report is stuck once its claim (refreshed before every send
+    /// attempt) is older than this. At least [`MIN_REAPER_AFTER`].
     pub after: Duration,
-    /// Time between reaper ticks.
+    /// Time between reaper ticks (clamped to at least one second).
     pub interval: Duration,
     /// Maximum reports re-claimed per tick.
     pub batch: u32,
@@ -143,7 +157,7 @@ impl ReportEmailService {
                 return;
             }
         };
-        self.send_claimed(job).await;
+        self.send_claimed(job, &[]).await;
     }
 
     /// Starts the periodic reaper in the background (see [`Self::reap_once`]).
@@ -154,7 +168,7 @@ impl ReportEmailService {
         }
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(policy.interval);
+            let mut ticker = tokio::time::interval(policy.interval.max(MIN_REAPER_INTERVAL));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
@@ -176,16 +190,20 @@ impl ReportEmailService {
             }
         };
         let count = jobs.len();
-        for job in jobs {
+        let ids: Vec<String> = jobs.iter().map(|job| job.scan_id.clone()).collect();
+        for (index, job) in jobs.into_iter().enumerate() {
             tracing::warn!(scan_id = %job.scan_id, "report email reaper: retrying a stuck send");
-            self.send_claimed(job).await;
+            // The reports queued behind this one are held too: they were claimed
+            // together and must not look stale while waiting their turn.
+            self.send_claimed(job, &ids[index + 1..]).await;
         }
         count
     }
 
     /// Renders and sends a report this process holds the claim of, then stores
-    /// `sent`, `failed` or `disabled` and audits it.
-    async fn send_claimed(&self, job: ClaimedReport) {
+    /// `sent`, `failed` or `disabled` and audits it. `queued` are the scan ids
+    /// this process also holds and has not started yet.
+    async fn send_claimed(&self, job: ClaimedReport, queued: &[String]) {
         let scan_id = job.scan_id.as_str();
         let Some(mailer) = &self.mailer else {
             tracing::info!(scan_id, "report email disabled: SMTP is not configured");
@@ -194,7 +212,12 @@ impl ReportEmailService {
         };
 
         let outcome = match self.build_email(&job) {
-            Ok(email) => self.send_with_retry(mailer.as_ref(), &email, scan_id).await,
+            Ok(email) => {
+                let mut held = vec![job.scan_id.clone()];
+                held.extend_from_slice(queued);
+                self.send_with_retry(mailer.as_ref(), &email, scan_id, &held)
+                    .await
+            }
             Err(error) => Err(error),
         };
         match outcome {
@@ -234,11 +257,13 @@ impl ReportEmailService {
         mailer: &dyn Mailer,
         email: &OutgoingEmail,
         scan_id: &str,
+        held: &[String],
     ) -> Result<(), MailerError> {
         let attempts = self.retry.attempts.max(1);
         let mut wait = self.retry.backoff;
         let mut last = MailerError::Transport;
         for attempt in 1..=attempts {
+            self.heartbeat(held).await;
             match mailer.send(email).await {
                 Ok(()) => return Ok(()),
                 Err(MailerError::Invalid) => return Err(MailerError::Invalid),
@@ -253,6 +278,15 @@ impl ReportEmailService {
             }
         }
         Err(last)
+    }
+
+    /// Refreshes the claim time of every report this process holds. A failure
+    /// is logged and the send goes on: the claim only goes stale if the store
+    /// stays unreachable for the whole threshold.
+    async fn heartbeat(&self, held: &[String]) {
+        if let Err(error) = self.store.touch(held).await {
+            tracing::error!(%error, "report email: could not refresh the claim time");
+        }
     }
 
     async fn finish(&self, job: &ClaimedReport, status: ReportEmailStatus) {

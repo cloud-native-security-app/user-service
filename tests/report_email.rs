@@ -528,3 +528,78 @@ async fn the_reaper_marks_failed_a_stale_report_whose_send_fails() {
         Some(ReportEmailStatus::Failed)
     );
 }
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn touch_refreshes_the_claim_time_of_a_pending_report_only() {
+    let db = start_db().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+
+    repo.touch(&["scan-1".to_string()]).await.expect("touch");
+    let age: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM now() - report_email_claimed_at)::float8 FROM scan_history",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("age");
+    assert!(age < 60.0, "touched, so no longer stale: {age}s");
+
+    repo.finish("scan-1", ReportEmailStatus::Sent, Utc::now())
+        .await
+        .expect("finish");
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+    sqlx::query("UPDATE scan_history SET report_email_status = 'sent'")
+        .execute(&db.pool)
+        .await
+        .expect("sent");
+    repo.touch(&["scan-1".to_string()]).await.expect("touch");
+    let age: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM now() - report_email_claimed_at)::float8 FROM scan_history",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("age");
+    assert!(age > 3000.0, "a finished report is left alone: {age}s");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn the_reaper_marks_failed_and_audits_a_row_whose_stored_data_cannot_be_read() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    // Corrupt stored data: the CHECK constraint is dropped to simulate it.
+    sqlx::query("ALTER TABLE scan_history DROP CONSTRAINT scan_history_scan_mode_check")
+        .execute(&db.pool)
+        .await
+        .expect("drop check");
+    sqlx::query("UPDATE scan_history SET scan_mode = 'bogus'")
+        .execute(&db.pool)
+        .await
+        .expect("corrupt");
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+
+    let processed = mailpit_service(&repo, &mailpit)
+        .await
+        .reap_once(&ReaperPolicy::default())
+        .await;
+
+    assert_eq!(processed, 0);
+    assert!(mailpit.messages().await.is_empty());
+    let status: Option<String> = sqlx::query_scalar("SELECT report_email_status FROM scan_history")
+        .fetch_one(&db.pool)
+        .await
+        .expect("status");
+    assert_eq!(status.as_deref(), Some("failed"));
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'report.email_failed'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("audits");
+    assert_eq!(audits, 1);
+}
