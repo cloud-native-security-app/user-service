@@ -604,3 +604,91 @@ async fn the_reaper_marks_failed_and_audits_a_row_whose_stored_data_cannot_be_re
             .expect("audits");
     assert_eq!(audits, 1);
 }
+
+/// Makes the stored `scan_mode` unreadable, as corrupt data would.
+async fn corrupt_scan_mode(pool: &PgPool) {
+    sqlx::query("ALTER TABLE scan_history DROP CONSTRAINT scan_history_scan_mode_check")
+        .execute(pool)
+        .await
+        .expect("drop check");
+    sqlx::query("UPDATE scan_history SET scan_mode = 'bogus'")
+        .execute(pool)
+        .await
+        .expect("corrupt");
+}
+
+async fn report_email_status(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT report_email_status FROM scan_history")
+        .fetch_one(pool)
+        .await
+        .expect("status")
+}
+
+async fn failed_audits(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'report.email_failed'")
+        .fetch_one(pool)
+        .await
+        .expect("audits")
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_failed_audit_insert_leaves_an_unreadable_row_pending_without_marking_it_failed() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    corrupt_scan_mode(&db.pool).await;
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+    // The audit insert fails: `failed` must not be stored without its audit.
+    sqlx::query(
+        "ALTER TABLE audit_log ADD CONSTRAINT refuse_email_failed \
+         CHECK (action <> 'report.email_failed')",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("add check");
+
+    let processed = mailpit_service(&repo, &mailpit)
+        .await
+        .reap_once(&ReaperPolicy::default())
+        .await;
+
+    assert_eq!(processed, 0);
+    assert!(mailpit.messages().await.is_empty());
+    assert_eq!(
+        report_email_status(&db.pool).await.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(failed_audits(&db.pool).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_transient_owner_lookup_error_leaves_the_row_pending_without_an_audit() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    assert!(repo.claim("scan-1").await.expect("claim").is_some());
+    strand_pending(&db.pool, "scan-1", "1 hour").await;
+    // `find_user` fails with a database error, not "no such user".
+    sqlx::query("ALTER TABLE users RENAME TO users_unavailable")
+        .execute(&db.pool)
+        .await
+        .expect("rename");
+
+    let processed = mailpit_service(&repo, &mailpit)
+        .await
+        .reap_once(&ReaperPolicy::default())
+        .await;
+
+    assert_eq!(processed, 0);
+    assert!(mailpit.messages().await.is_empty());
+    assert_eq!(
+        report_email_status(&db.pool).await.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(failed_audits(&db.pool).await, 0);
+}

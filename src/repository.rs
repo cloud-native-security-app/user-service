@@ -882,12 +882,22 @@ impl Repository {
         let (scan_id, user_id, target, scan_mode, result, finished_at) = row;
         let Some(mode) = ScanMode::from_db_str(&scan_mode) else {
             return self
-                .fail_unrecoverable(&scan_id, &user_id, RepoError::Backend)
+                .fail_unrecoverable(
+                    &scan_id,
+                    &user_id,
+                    RepoError::Backend,
+                    "unreadable stored scan_mode",
+                )
                 .await;
         };
         let Some(owner) = self.find_user(&user_id).await? else {
             return self
-                .fail_unrecoverable(&scan_id, &user_id, RepoError::NotFound)
+                .fail_unrecoverable(
+                    &scan_id,
+                    &user_id,
+                    RepoError::NotFound,
+                    "owner account not found",
+                )
                 .await;
         };
         Ok(ClaimedReport {
@@ -904,20 +914,49 @@ impl Repository {
 
 impl Repository {
     /// Stores `failed` and the failure audit entry for a claimed report whose
-    /// data can never be sent, then returns `error`.
+    /// data can never be sent, in one transaction, then returns `error`.
+    ///
+    /// If either write fails nothing is stored: the row stays `pending` with
+    /// no audit entry and the reaper retries it after the threshold.
     async fn fail_unrecoverable(
         &self,
         scan_id: &str,
         user_id: &str,
         error: RepoError,
+        reason: &'static str,
     ) -> Result<ClaimedReport, RepoError> {
-        self.finish(scan_id, ReportEmailStatus::Failed, chrono::Utc::now())
-            .await?;
-        self.audit(user_id, REPORT_EMAIL_FAILED_ACTION, scan_id)
-            .await?;
+        let entry = AuditEntry::new(
+            uuid::Uuid::new_v4().to_string(),
+            user_id,
+            scan_id,
+            REPORT_EMAIL_FAILED_ACTION,
+            chrono::Utc::now(),
+        );
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE scan_history SET report_email_status = 'failed', \
+             report_emailed_at = NULL WHERE scan_id = $1",
+        )
+        .bind(scan_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO audit_log (id, user_id, target, action, recorded_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(entry.id())
+        .bind(entry.user_id())
+        .bind(entry.target())
+        .bind(entry.action())
+        .bind(entry.recorded_at())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.emit_audit_recorded(std::slice::from_ref(&entry));
         tracing::error!(
             scan_id,
-            "report email: unreadable stored data, marked failed"
+            reason,
+            "report email: cannot be sent, marked failed"
         );
         Err(error)
     }
