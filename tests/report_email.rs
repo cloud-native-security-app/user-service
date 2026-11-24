@@ -518,6 +518,7 @@ async fn the_reaper_marks_failed_a_stale_report_whose_send_fails() {
         RetryPolicy {
             attempts: 1,
             backoff: Duration::ZERO,
+            ..RetryPolicy::default()
         },
     );
 

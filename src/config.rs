@@ -14,7 +14,7 @@ use std::time::Duration;
 use secrecy::{SecretBox, SecretSlice, SecretString};
 
 use crate::domain::{AdminEmails, NetworkScanEmails};
-use crate::report_email::service::{ReaperPolicy, MIN_REAPER_AFTER};
+use crate::report_email::service::{ReaperPolicy, RetryPolicy};
 use crate::report_email::smtp::{SmtpMailer, SmtpSettings, SmtpTls};
 
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
@@ -342,7 +342,8 @@ fn read_smtp(
 }
 
 /// Reads the reaper durations (whole seconds; the interval at least 1, the
-/// threshold at least [`MIN_REAPER_AFTER`]). Errors name the
+/// threshold above the worst claim-refresh gap of the send retry policy, which
+/// is the default one: see [`RetryPolicy::min_reaper_after`]). Errors name the
 /// variable only.
 fn read_reaper(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ReaperPolicy, ConfigError> {
     let defaults = ReaperPolicy::default();
@@ -355,9 +356,11 @@ fn read_reaper(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ReaperPolic
         },
     };
     let after = seconds(REPORT_EMAIL_REAPER_AFTER_SECS_VAR, defaults.after)?;
-    if after < MIN_REAPER_AFTER {
-        return Err(ConfigError::InvalidReportEmailReaper {
+    let minimum = RetryPolicy::default().min_reaper_after();
+    if after < minimum {
+        return Err(ConfigError::ReportEmailReaperAfterTooShort {
             variable: REPORT_EMAIL_REAPER_AFTER_SECS_VAR,
+            minimum_secs: minimum.as_secs(),
         });
     }
     Ok(ReaperPolicy {
@@ -510,13 +513,23 @@ pub enum ConfigError {
     )]
     InsecureSmtpCredentials,
     /// A report email reaper variable is not a whole number of seconds >= 1.
-    #[error(
-        "the environment variable {variable} must be a whole number of seconds, at least 1 \
-         (REPORT_EMAIL_REAPER_AFTER_SECS: at least 120)"
-    )]
+    #[error("the environment variable {variable} must be a whole number of seconds, at least 1")]
     InvalidReportEmailReaper {
         /// Name of the offending variable.
         variable: &'static str,
+    },
+    /// The reaper threshold is not above one SMTP attempt deadline plus the
+    /// largest retry backoff wait, so a live sender could be judged stale.
+    #[error(
+        "the environment variable {variable} must be greater than the longest gap between claim \
+         refreshes of a live send (one attempt deadline plus the largest retry backoff): at \
+         least {minimum_secs} seconds"
+    )]
+    ReportEmailReaperAfterTooShort {
+        /// Name of the offending variable.
+        variable: &'static str,
+        /// Smallest accepted value, in seconds.
+        minimum_secs: u64,
     },
     /// Alguna entrada de `NETWORK_SCAN_EMAILS` no es un correo válido. No
     /// incluye el valor, que puede ser un correo real mal escrito.
@@ -1159,14 +1172,22 @@ mod tests {
     }
 
     #[test]
-    fn a_reaper_threshold_below_the_minimum_is_refused() {
+    fn a_reaper_threshold_at_or_below_the_attempt_bound_is_refused() {
+        // Default retry: 60s attempt deadline + 4s largest backoff = 64s.
+        for value in ["1", "64"] {
+            let mut env = FakeEnv::valid();
+            env.set("REPORT_EMAIL_REAPER_AFTER_SECS", value);
+            let error = env.load().unwrap_err().to_string();
+            assert!(error.contains("REPORT_EMAIL_REAPER_AFTER_SECS"), "{error}");
+            assert!(error.contains("65"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_reaper_threshold_just_above_the_attempt_bound_is_accepted() {
         let mut env = FakeEnv::valid();
-        env.set("REPORT_EMAIL_REAPER_AFTER_SECS", "119");
-        let error = env.load().unwrap_err();
-        assert!(
-            error.to_string().contains("REPORT_EMAIL_REAPER_AFTER_SECS"),
-            "{error}"
-        );
-        assert!(error.to_string().contains("120"), "{error}");
+        env.set("REPORT_EMAIL_REAPER_AFTER_SECS", "65");
+        let reaper = env.load().unwrap().report_email_reaper;
+        assert_eq!(reaper.after, Duration::from_secs(65));
     }
 }

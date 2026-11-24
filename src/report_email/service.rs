@@ -69,13 +69,19 @@ pub trait ReportEmailStore: Send + Sync {
     async fn audit(&self, user_id: &str, action: &str, scan_id: &str) -> Result<(), RepoError>;
 }
 
-/// Bounded retry: `attempts` tries, waiting `backoff`, `2 * backoff`, ... between them.
+/// Bounded retry: `attempts` tries, waiting `backoff`, `2 * backoff`, ... between
+/// them, each try cut off after `attempt_timeout`.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     /// Total number of send attempts (at least 1).
     pub attempts: u32,
     /// Wait before the second attempt; doubles after each failure.
     pub backoff: Duration,
+    /// Overall deadline of one attempt, from connect through DATA. The SMTP
+    /// adapter only times each network operation (20 s), so one attempt is a
+    /// sequence of them and has no bound of its own: this is it. An attempt
+    /// that hits it counts as a failed attempt.
+    pub attempt_timeout: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -83,15 +89,39 @@ impl Default for RetryPolicy {
         Self {
             attempts: 3,
             backoff: Duration::from_secs(2),
+            attempt_timeout: SMTP_ATTEMPT_TIMEOUT,
         }
     }
 }
 
-/// Smallest accepted `ReaperPolicy::after`. The heartbeat refreshes the claim
-/// before every send attempt, so a live sender is stale only if one attempt
-/// outlasts `after`. One SMTP attempt is bounded by a 20 s timeout per network
-/// operation; 120 s leaves a wide margin over it.
-pub const MIN_REAPER_AFTER: Duration = Duration::from_secs(120);
+/// Default overall deadline of one SMTP attempt (a documented constant, not a
+/// setting: the reaper threshold is validated against it at startup).
+pub const SMTP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl RetryPolicy {
+    /// Longest the claim of a live sender can go without a refresh. The
+    /// heartbeat runs before every attempt, so the worst gap is the largest
+    /// backoff wait between two attempts plus one attempt deadline (the last
+    /// attempt is followed by no wait). Computed from the policy, never
+    /// hardcoded.
+    pub fn max_refresh_gap(&self) -> Duration {
+        let waits = self.attempts.max(1) - 1;
+        let largest_wait = match waits {
+            0 => Duration::ZERO,
+            _ if self.backoff.is_zero() => Duration::ZERO,
+            // Doubling 32 times or more overflows any realistic backoff.
+            1..=32 => self.backoff.saturating_mul(1 << (waits - 1)),
+            _ => Duration::MAX,
+        };
+        self.attempt_timeout.saturating_add(largest_wait)
+    }
+
+    /// Smallest whole-second [`ReaperPolicy::after`] that is strictly greater
+    /// than [`Self::max_refresh_gap`], so a live sender is never judged stale.
+    pub fn min_reaper_after(&self) -> Duration {
+        Duration::from_secs(self.max_refresh_gap().as_secs().saturating_add(1))
+    }
+}
 
 /// Shortest period the reaper ticks at: a zero interval would panic the timer.
 const MIN_REAPER_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,7 +130,9 @@ const MIN_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Copy)]
 pub struct ReaperPolicy {
     /// A `pending` report is stuck once its claim (refreshed before every send
-    /// attempt) is older than this. At least [`MIN_REAPER_AFTER`].
+    /// attempt) is older than this. Must exceed
+    /// [`RetryPolicy::max_refresh_gap`] (startup enforces
+    /// [`RetryPolicy::min_reaper_after`]).
     pub after: Duration,
     /// Time between reaper ticks (clamped to at least one second).
     pub interval: Duration,
@@ -264,7 +296,15 @@ impl ReportEmailService {
         let mut last = MailerError::Transport;
         for attempt in 1..=attempts {
             self.heartbeat(held).await;
-            match mailer.send(email).await {
+            let result =
+                match tokio::time::timeout(self.retry.attempt_timeout, mailer.send(email)).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        tracing::warn!(scan_id, attempt, "report email attempt timed out");
+                        Err(MailerError::Transport)
+                    }
+                };
+            match result {
                 Ok(()) => return Ok(()),
                 Err(MailerError::Invalid) => return Err(MailerError::Invalid),
                 Err(error) => {
