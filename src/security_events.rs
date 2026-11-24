@@ -8,7 +8,7 @@
 //!
 //! `user-service` produce un solo tipo, `audit.recorded`, uno por cada entrada
 //! que escribe en `audit_log` (ver [`crate::audit::recorded_event`] para el
-//! mapeo de acciones). [`EventType`] cubre los 11 valores del contrato para
+//! mapeo de acciones). [`EventType`] cubre los 12 valores del contrato para
 //! poder deserializar los ejemplos.
 //!
 //! Los adaptadores viven en [`crate::messaging::kinesis`] (real) y en este
@@ -48,7 +48,7 @@ const MAX_ACTOR_SUB_CHARS: usize = 128;
 /// Máximo de caracteres de un slug de acción o tipo de recurso.
 const MAX_SLUG_CHARS: usize = 64;
 
-/// Tipo de un [`SecurityEvent`]; cubre los 11 valores del contrato aunque
+/// Tipo de un [`SecurityEvent`]; cubre los 12 valores del contrato aunque
 /// `user-service` solo produce [`EventType::AuditRecorded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
@@ -85,6 +85,9 @@ pub enum EventType {
     /// `user-service` registró una acción de auditoría.
     #[serde(rename = "audit.recorded")]
     AuditRecorded,
+    /// El Gateway reenvió una alerta SIEM de Wazuh.
+    #[serde(rename = "siem.alert")]
+    SiemAlert,
 }
 
 impl EventType {
@@ -102,6 +105,7 @@ impl EventType {
             Self::RatelimitHit => "ratelimit.hit",
             Self::MessageDeadlettered => "message.deadlettered",
             Self::AuditRecorded => "audit.recorded",
+            Self::SiemAlert => "siem.alert",
         }
     }
 }
@@ -118,6 +122,9 @@ pub enum EventSource {
     /// `user-service` (este servicio).
     #[serde(rename = "user-service")]
     UserService,
+    /// Un SIEM Wazuh (`siem.alert`, reenviado por el Gateway).
+    #[serde(rename = "wazuh")]
+    Wazuh,
 }
 
 /// Evento de seguridad inmutable: el sobre del contrato
