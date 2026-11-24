@@ -173,6 +173,7 @@ fn service(
         RetryPolicy {
             attempts: 3,
             backoff: Duration::ZERO,
+            ..RetryPolicy::default()
         },
     ))
 }
@@ -356,6 +357,7 @@ fn secs(n: u64) -> Duration {
 struct SlowMailer {
     delay: Duration,
     fail_first: usize,
+    hang_first: usize,
     attempts: Mutex<usize>,
     sent: Mutex<usize>,
 }
@@ -365,6 +367,7 @@ impl SlowMailer {
         Arc::new(Self {
             delay,
             fail_first,
+            hang_first: 0,
             attempts: Mutex::new(0),
             sent: Mutex::new(0),
         })
@@ -372,6 +375,21 @@ impl SlowMailer {
 
     fn sent(&self) -> usize {
         *self.sent.lock().unwrap()
+    }
+
+    fn attempts(&self) -> usize {
+        *self.attempts.lock().unwrap()
+    }
+
+    /// Mailer whose first `hang` attempts never answer; later ones take `delay`.
+    fn hanging_first(hang: usize, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            delay,
+            fail_first: 0,
+            hang_first: hang,
+            attempts: Mutex::new(0),
+            sent: Mutex::new(0),
+        })
     }
 }
 
@@ -383,6 +401,9 @@ impl Mailer for SlowMailer {
             *attempts += 1;
             *attempts
         };
+        if attempt <= self.hang_first {
+            std::future::pending::<()>().await;
+        }
         tokio::time::sleep(self.delay).await;
         if attempt <= self.fail_first {
             return Err(MailerError::Transport);
@@ -405,6 +426,7 @@ fn slow_service(
         RetryPolicy {
             attempts: 3,
             backoff,
+            ..RetryPolicy::default()
         },
     ))
 }
@@ -511,4 +533,104 @@ async fn a_zero_interval_does_not_panic_the_reaper_and_ticks_every_second() {
 
     // Clamped to one second: ticks at 0s, 1s, 2s and 3s.
     assert_eq!(store.state.lock().unwrap().reclaim_calls, 4);
+}
+
+fn retry(attempts: u32, backoff: u64, attempt_timeout: u64) -> RetryPolicy {
+    RetryPolicy {
+        attempts,
+        backoff: secs(backoff),
+        attempt_timeout: secs(attempt_timeout),
+    }
+}
+
+fn service_with(
+    store: &Arc<FakeStore>,
+    mailer: &Arc<SlowMailer>,
+    retry: RetryPolicy,
+) -> Arc<ReportEmailService> {
+    let store: Arc<dyn ReportEmailStore> = store.clone();
+    let mailer: Arc<dyn Mailer> = mailer.clone();
+    Arc::new(ReportEmailService::new(store, Some(mailer), retry))
+}
+
+#[test]
+fn the_default_attempt_deadline_is_sixty_seconds() {
+    assert_eq!(RetryPolicy::default().attempt_timeout, secs(60));
+}
+
+#[test]
+fn the_reaper_minimum_is_the_deadline_plus_the_largest_backoff_wait() {
+    // Waits between attempts: 2s, 4s. The largest is 4s.
+    assert_eq!(RetryPolicy::default().max_refresh_gap(), secs(64));
+    // Waits: 2s, 4s, 8s.
+    assert_eq!(retry(4, 2, 60).max_refresh_gap(), secs(68));
+    // One attempt never waits.
+    assert_eq!(retry(1, 30, 60).max_refresh_gap(), secs(60));
+    // Zero attempts still run once.
+    assert_eq!(retry(0, 30, 60).max_refresh_gap(), secs(60));
+}
+
+#[test]
+fn the_largest_backoff_wait_does_not_overflow() {
+    let policy = RetryPolicy {
+        attempts: u32::MAX,
+        backoff: Duration::MAX,
+        attempt_timeout: secs(60),
+    };
+    assert!(policy.max_refresh_gap() >= secs(60));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_attempt_is_cut_at_the_deadline_and_counted_as_failed() {
+    // Every attempt hangs: cut at 10s, wait 5s, cut at 10s again.
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = SlowMailer::new(secs(3600), 0);
+    let service = service_with(&store, &mailer, retry(2, 5, 10));
+    let started = Instant::now();
+
+    service.process_completed("scan-1").await;
+
+    assert_eq!(started.elapsed(), secs(25));
+    assert_eq!(mailer.attempts(), 2);
+    assert_eq!(mailer.sent(), 0);
+    assert_eq!(store.last_status(), Some(ReportEmailStatus::Failed));
+    assert_eq!(store.audit_actions(), vec![REPORT_EMAIL_FAILED_ACTION]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_attempt_is_retried_and_a_later_one_can_succeed() {
+    // The first attempt hangs, the second answers in 1s.
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = SlowMailer::hanging_first(1, secs(1));
+    let service = service_with(&store, &mailer, retry(3, 5, 10));
+
+    service.process_completed("scan-1").await;
+
+    assert_eq!(mailer.attempts(), 2);
+    assert_eq!(mailer.sent(), 1);
+    assert_eq!(store.last_status(), Some(ReportEmailStatus::Sent));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_but_live_sender_is_never_taken_by_the_reaper_at_the_minimum() {
+    // Default policy: 60s deadline, waits 2s and 4s. Attempts take 50s and
+    // fail, so the claim is refreshed at 0s, 52s and 106s: gaps of 52s and
+    // 54s, under the 65s minimum threshold.
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = SlowMailer::new(secs(50), 2);
+    let retry = RetryPolicy::default();
+    let service = service_with(&store, &mailer, retry);
+    let policy = ReaperPolicy {
+        after: retry.max_refresh_gap() + secs(1),
+        ..ReaperPolicy::default()
+    };
+
+    let (_, taken) = tokio::join!(
+        service.process_completed("scan-1"),
+        reap_repeatedly(&service, &policy, 5, 40)
+    );
+
+    assert_eq!(taken, 0, "the heartbeat gap stays under `after`");
+    assert_eq!(mailer.sent(), 1);
+    assert_eq!(store.last_status(), Some(ReportEmailStatus::Sent));
 }

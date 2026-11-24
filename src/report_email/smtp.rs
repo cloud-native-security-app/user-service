@@ -16,7 +16,9 @@ use secrecy::{ExposeSecret, SecretString};
 
 use super::mailer::{Mailer, MailerError, OutgoingEmail};
 
-/// Time allowed for each SMTP exchange.
+/// Time allowed for each network operation of an SMTP attempt (connect, EHLO,
+/// STARTTLS, AUTH, MAIL, RCPT, DATA). It does not bound the attempt as a whole:
+/// the service wraps every attempt in `RetryPolicy::attempt_timeout`.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Transport security of the SMTP connection.
