@@ -18,7 +18,7 @@ use user_service::audit::{
     recorded_event, ROLE_GRANTED_ACTION, ROLE_REVOKED_ACTION, SCAN_REQUESTED_ACTION,
 };
 use user_service::domain::AuditEntry;
-use user_service::security_events::{EventSource, SecurityEvent};
+use user_service::security_events::{EventSource, EventType, SecurityEvent};
 
 fn broker_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -135,6 +135,8 @@ fn broker_examples_deserialize_into_security_event_and_round_trip() {
         checked += 1;
     }
     assert!(
+        // One example per event type (12) plus the network-scan variants of
+        // scan.requested (2) and the Suricata variant of siem.alert (1).
         checked >= 15,
         "se esperaban al menos los 15 ejemplos del contrato"
     );
@@ -160,4 +162,33 @@ fn audit_recorded_example_has_the_same_shape_as_the_constructor_output() {
         strip(example),
         "audit-recorded.json difiere de la salida del constructor"
     );
+}
+
+/// Self-contained (no `../broker` checkout needed, so CI runs it too): the
+/// `siem.alert` type and the `wazuh` source the Gateway relays deserialize,
+/// map to their variants, and serialize back to the same JSON.
+#[test]
+fn a_wazuh_siem_alert_deserializes_and_serializes_back_unchanged() {
+    let original = serde_json::json!({
+        "event_id": "3f2b8c1e-5d4a-4e7b-9a10-2c6d8e0f1a10",
+        "event_type": "siem.alert",
+        "occurred_at": "2026-11-09T12:30:00Z",
+        "source": "wazuh",
+        "payload": {
+            "rule_id": "5710",
+            "rule_level": 5,
+            "severity": "low",
+            "description": "sshd: attempt to login using a non-existent user",
+            "agent": {"id": "001", "name": "lab-target"},
+            "src_ip": "203.0.113.7"
+        }
+    });
+
+    let event: SecurityEvent =
+        serde_json::from_value(original.clone()).expect("siem.alert deserializes");
+
+    assert_eq!(event.event_type(), EventType::SiemAlert);
+    assert_eq!(event.event_type_str(), "siem.alert");
+    assert_eq!(event.source(), EventSource::Wazuh);
+    assert_eq!(serde_json::to_value(&event).expect("serializes"), original);
 }
