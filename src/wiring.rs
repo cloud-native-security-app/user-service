@@ -136,7 +136,8 @@ async fn build_router_with_connect_timeout(
 }
 
 /// Builds the SMTP mailer, or `None` (report email disabled) when `SMTP_HOST`
-/// is unset or the settings cannot build a transport. Opens no connection.
+/// is unset. Opens no connection. `Config::from_lookup` already rejected
+/// settings that cannot build a transport, so that branch is unreachable.
 fn build_mailer(config: &Config) -> Option<Arc<dyn Mailer>> {
     let Some(settings) = &config.smtp else {
         tracing::info!("report email disabled: SMTP_HOST is not set");
@@ -148,7 +149,7 @@ fn build_mailer(config: &Config) -> Option<Arc<dyn Mailer>> {
             Some(Arc::new(mailer))
         }
         Err(_) => {
-            tracing::error!("report email disabled: the SMTP settings are not usable");
+            tracing::error!("report email disabled: the SMTP settings are not usable (config validation should have refused them)");
             None
         }
     }

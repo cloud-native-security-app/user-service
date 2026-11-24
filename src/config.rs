@@ -15,7 +15,7 @@ use secrecy::{SecretBox, SecretSlice, SecretString};
 
 use crate::domain::{AdminEmails, NetworkScanEmails};
 use crate::report_email::service::{ReaperPolicy, MIN_REAPER_AFTER};
-use crate::report_email::smtp::{SmtpSettings, SmtpTls};
+use crate::report_email::smtp::{SmtpMailer, SmtpSettings, SmtpTls};
 
 /// Nombre de la variable de entorno con la URL de conexión a PostgreSQL.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
@@ -298,6 +298,12 @@ fn read_smtp(
     let Some(host) = read_optional(lookup, SMTP_HOST_VAR) else {
         return Ok(None);
     };
+    let host_chars_ok = host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'));
+    if !host_chars_ok {
+        return Err(invalid(SMTP_HOST_VAR));
+    }
     let port = match read_optional(lookup, SMTP_PORT_VAR) {
         None => 587,
         Some(raw) => raw.parse::<u16>().map_err(|_| invalid(SMTP_PORT_VAR))?,
@@ -309,6 +315,9 @@ fn read_smtp(
     };
     let username = read_optional(lookup, SMTP_USERNAME_VAR);
     let password = read_optional(lookup, SMTP_PASSWORD_VAR).map(SecretString::from);
+    if tls == SmtpTls::None && (username.is_some() || password.is_some()) {
+        return Err(ConfigError::InsecureSmtpCredentials);
+    }
     if username.is_some() != password.is_some() {
         return Err(invalid(SMTP_PASSWORD_VAR));
     }
@@ -318,14 +327,18 @@ fn read_smtp(
     if from.parse::<lettre::message::Mailbox>().is_err() {
         return Err(invalid(SMTP_FROM_VAR));
     }
-    Ok(Some(SmtpSettings {
+    let settings = SmtpSettings {
         host,
         port,
         username,
         password,
         from,
         tls,
-    }))
+    };
+    // Builds the transport without connecting, so an unusable host fails the
+    // startup instead of silently disabling the email later.
+    SmtpMailer::new(&settings).map_err(|_| invalid(SMTP_HOST_VAR))?;
+    Ok(Some(settings))
 }
 
 /// Reads the reaper durations (whole seconds; the interval at least 1, the
@@ -489,6 +502,13 @@ pub enum ConfigError {
         /// Name of the offending variable.
         variable: &'static str,
     },
+    /// SMTP credentials with `SMTP_TLS=none` would travel in plain text.
+    /// Names the variables only, never their values.
+    #[error(
+        "SMTP_TLS=none sends in plain text, so SMTP_USERNAME and SMTP_PASSWORD must not be set \
+         with it: use SMTP_TLS=starttls or remove the credentials"
+    )]
+    InsecureSmtpCredentials,
     /// A report email reaper variable is not a whole number of seconds >= 1.
     #[error(
         "the environment variable {variable} must be a whole number of seconds, at least 1 \
@@ -988,6 +1008,112 @@ mod tests {
         let mut env = FakeEnv::valid();
         env.set("SMTP_HOST", "mailpit");
         assert!(env.load().is_err(), "no sender address");
+    }
+
+    #[test]
+    fn smtp_tls_none_with_credentials_is_refused_naming_the_variables_not_the_values() {
+        let cases: [&[(&'static str, &'static str)]; 3] = [
+            &[
+                ("SMTP_USERNAME", "reports@example.test"),
+                ("SMTP_PASSWORD", "plain-secret-pw"),
+            ],
+            &[("SMTP_USERNAME", "reports@example.test")],
+            &[("SMTP_PASSWORD", "plain-secret-pw")],
+        ];
+        for creds in cases {
+            let mut env = FakeEnv::valid();
+            env.set("SMTP_HOST", "mailpit");
+            env.set("SMTP_TLS", "none");
+            env.set("SMTP_FROM", "noreply@example.test");
+            for (name, value) in creds {
+                env.set(name, *value);
+            }
+            let err = env.load().expect_err("credentials over plain text");
+            assert!(matches!(err, ConfigError::InsecureSmtpCredentials), "{err}");
+            let text = err.to_string();
+            for named in ["SMTP_TLS", "SMTP_USERNAME", "SMTP_PASSWORD"] {
+                assert!(text.contains(named), "{text}");
+            }
+            assert!(!text.contains("plain-secret-pw") && !text.contains("reports@example.test"));
+        }
+    }
+
+    #[test]
+    fn smtp_credentials_stay_valid_with_starttls_and_mailpit_without_them_stays_valid() {
+        for tls in [None, Some("starttls")] {
+            let mut env = smtp_env();
+            if let Some(tls) = tls {
+                env.set("SMTP_TLS", tls);
+            }
+            assert!(env.load().unwrap().smtp.is_some());
+        }
+        let mut env = FakeEnv::valid();
+        env.set("SMTP_HOST", "mailpit");
+        env.set("SMTP_TLS", "none");
+        env.set("SMTP_FROM", "noreply@example.test");
+        // Blank credentials count as unset.
+        env.set("SMTP_USERNAME", " ");
+        env.set("SMTP_PASSWORD", "");
+        assert!(env.load().unwrap().smtp.is_some());
+    }
+
+    fn invalid_smtp_variable(env: &FakeEnv) -> &'static str {
+        match env.load().expect_err("an unusable SMTP config must fail") {
+            ConfigError::InvalidSmtp { variable } => variable,
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn an_unusable_smtp_config_with_a_host_fails_naming_the_variable() {
+        let with = |name: &'static str, value: &'static str| {
+            let mut env = smtp_env();
+            env.set(name, value);
+            env
+        };
+        assert_eq!(
+            invalid_smtp_variable(&with("SMTP_PORT", "abc")),
+            "SMTP_PORT"
+        );
+        assert_eq!(
+            invalid_smtp_variable(&with("SMTP_PORT", "70000")),
+            "SMTP_PORT"
+        );
+        assert_eq!(invalid_smtp_variable(&with("SMTP_PORT", "-1")), "SMTP_PORT");
+        assert_eq!(invalid_smtp_variable(&with("SMTP_TLS", "tls")), "SMTP_TLS");
+        assert_eq!(
+            invalid_smtp_variable(&with("SMTP_FROM", "nope")),
+            "SMTP_FROM"
+        );
+        assert_eq!(
+            invalid_smtp_variable(&with("SMTP_HOST", "bad host")),
+            "SMTP_HOST"
+        );
+        // No explicit sender and no username to default to.
+        let mut env = FakeEnv::valid();
+        env.set("SMTP_HOST", "smtp.example.test");
+        assert_eq!(invalid_smtp_variable(&env), "SMTP_FROM");
+        // Only one of username and password.
+        let mut env = smtp_env();
+        env.remove("SMTP_PASSWORD");
+        assert_eq!(invalid_smtp_variable(&env), "SMTP_PASSWORD");
+        let mut env = smtp_env();
+        env.remove("SMTP_USERNAME");
+        env.set("SMTP_FROM", "reports@example.test");
+        assert_eq!(invalid_smtp_variable(&env), "SMTP_PASSWORD");
+    }
+
+    #[test]
+    fn the_lab_placeholder_of_single_spaces_keeps_email_disabled() {
+        let mut env = FakeEnv::valid();
+        for name in ["SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD"] {
+            env.set(name, " ");
+        }
+        assert!(env
+            .load()
+            .expect("a fresh lab deploy must start")
+            .smtp
+            .is_none());
     }
 
     #[test]
