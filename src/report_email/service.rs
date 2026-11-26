@@ -44,6 +44,19 @@ pub trait ReportEmailStore: Send + Sync {
     /// `None` when the scan is not `COMPLETADO` or the email was already claimed.
     async fn claim(&self, scan_id: &str) -> Result<Option<ClaimedReport>, RepoError>;
 
+    /// Atomically claims the report email of `scan_id` for a queue consumer
+    /// (status `pending`, claim time now). Claimable: a `COMPLETADO` scan in no
+    /// state yet, or `pending` or `failed` (a message redriven from the DLQ)
+    /// whose claim is missing or older than `lease`. `sent` and `disabled` are
+    /// final. `None` when there is nothing to send now: the scan is missing,
+    /// not completed, final, leased by another consumer, or its stored data is
+    /// unreadable (stored `failed` and audited by the store).
+    async fn claim_for_queue(
+        &self,
+        scan_id: &str,
+        lease: Duration,
+    ) -> Result<Option<ClaimedReport>, RepoError>;
+
     /// Atomically re-claims up to `limit` reports left `pending` for longer than
     /// `older_than` (a send lost to a shutdown or crash), refreshing their claim
     /// time so no other caller gets them.
@@ -150,6 +163,16 @@ impl Default for ReaperPolicy {
     }
 }
 
+/// What the queue consumer does with the message after
+/// [`ReportEmailService::handle_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Nothing is left to do for this message: delete it.
+    Done,
+    /// Leave the message in the queue for SQS to redeliver (or redrive).
+    Retry,
+}
+
 /// Orchestrates claim, render, send with retry, status and audit.
 pub struct ReportEmailService {
     store: Arc<dyn ReportEmailStore>,
@@ -190,6 +213,75 @@ impl ReportEmailService {
             }
         };
         self.send_claimed(job, &[]).await;
+    }
+
+    /// Handles one queue message for `scan_id`: claims the row with a `lease`,
+    /// makes exactly one send attempt (bounded by the attempt deadline) and
+    /// maps the result to a [`QueueOutcome`]. `receive_count` is the SQS
+    /// `ApproximateReceiveCount`; `max_receives` the queue's `maxReceiveCount`.
+    ///
+    /// A failure before the last receive leaves the row `pending`. A failure on
+    /// the last receive stores `failed` and audits it, and still returns
+    /// [`QueueOutcome::Retry`]: the message must NOT be deleted, so the queue's
+    /// redrive policy moves it to the DLQ, where it can be inspected and
+    /// redriven (a `failed` row can be claimed again).
+    pub async fn handle_request(
+        &self,
+        scan_id: &str,
+        receive_count: u32,
+        max_receives: u32,
+        lease: Duration,
+    ) -> QueueOutcome {
+        let job = match self.store.claim_for_queue(scan_id, lease).await {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                tracing::info!(scan_id, "report email queue: nothing to send");
+                return QueueOutcome::Done;
+            }
+            Err(error) => {
+                tracing::error!(%error, scan_id, "report email queue: could not claim the send");
+                return QueueOutcome::Retry;
+            }
+        };
+        let Some(mailer) = &self.mailer else {
+            tracing::info!(scan_id, "report email disabled: SMTP is not configured");
+            self.finish(&job, ReportEmailStatus::Disabled).await;
+            return QueueOutcome::Done;
+        };
+        let attempt = match self.build_email(&job) {
+            Ok(email) => {
+                match tokio::time::timeout(self.retry.attempt_timeout, mailer.send(&email)).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        tracing::warn!(scan_id, "report email attempt timed out");
+                        Err(MailerError::Transport)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match attempt {
+            Ok(()) => {
+                // If the status write fails it is logged and the message is still
+                // deleted: the email is out, so it is never resent from here (the
+                // row stays `pending` and the reaper may resend it later).
+                self.record_sent(&job).await;
+                QueueOutcome::Done
+            }
+            // Data that can never be rendered: a retry cannot help.
+            Err(MailerError::Invalid) => {
+                tracing::warn!(scan_id, "report email failed: unrenderable report");
+                self.record_failed(&job).await;
+                QueueOutcome::Done
+            }
+            Err(error) => {
+                tracing::warn!(%error, scan_id, receive_count, max_receives, "report email failed");
+                if receive_count >= max_receives {
+                    self.record_failed(&job).await;
+                }
+                QueueOutcome::Retry
+            }
+        }
     }
 
     /// Starts the periodic reaper in the background (see [`Self::reap_once`]).
@@ -253,16 +345,22 @@ impl ReportEmailService {
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(()) => {
-                self.finish(&job, ReportEmailStatus::Sent).await;
-                self.audit(&job, REPORT_EMAILED_ACTION).await;
-            }
+            Ok(()) => self.record_sent(&job).await,
             Err(error) => {
                 tracing::warn!(%error, scan_id, "report email failed");
-                self.finish(&job, ReportEmailStatus::Failed).await;
-                self.audit(&job, REPORT_EMAIL_FAILED_ACTION).await;
+                self.record_failed(&job).await;
             }
         }
+    }
+
+    async fn record_sent(&self, job: &ClaimedReport) {
+        self.finish(job, ReportEmailStatus::Sent).await;
+        self.audit(job, REPORT_EMAILED_ACTION).await;
+    }
+
+    async fn record_failed(&self, job: &ClaimedReport) {
+        self.finish(job, ReportEmailStatus::Failed).await;
+        self.audit(job, REPORT_EMAIL_FAILED_ACTION).await;
     }
 
     fn build_email(&self, job: &ClaimedReport) -> Result<OutgoingEmail, MailerError> {

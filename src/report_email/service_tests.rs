@@ -11,7 +11,7 @@ use tokio::time::Instant;
 
 use super::mailer::{InMemoryMailer, Mailer, MailerError, OutgoingEmail};
 use super::service::{
-    ClaimedReport, ReaperPolicy, ReportEmailService, ReportEmailStore, RetryPolicy,
+    ClaimedReport, QueueOutcome, ReaperPolicy, ReportEmailService, ReportEmailStore, RetryPolicy,
 };
 use crate::audit::{REPORT_EMAILED_ACTION, REPORT_EMAIL_FAILED_ACTION};
 use crate::domain::{ReportEmailStatus, ScanMode};
@@ -43,6 +43,10 @@ struct StoreState {
     claim_times: HashMap<String, Instant>,
     /// How many times the reaper asked for stale reports.
     reclaim_calls: usize,
+    /// Rows as the queue claim sees them: status and last claim time.
+    rows: HashMap<String, (Option<ReportEmailStatus>, Option<Instant>)>,
+    /// Makes `claim_for_queue` fail with a store error.
+    fail_queue_claim: bool,
 }
 
 /// In-memory store: `completed` scans can be claimed once, like the SQL claim.
@@ -63,6 +67,24 @@ impl FakeStore {
         let store = Self::with_completed("unused");
         store.state.lock().unwrap().stale = scan_ids.iter().map(|s| s.to_string()).collect();
         store
+    }
+
+    /// A completed scan already in `status`, claimed just now when `claimed`.
+    fn with_row(scan_id: &str, status: Option<ReportEmailStatus>, claimed: bool) -> Arc<Self> {
+        let store = Self::with_completed(scan_id);
+        let at = claimed.then(Instant::now);
+        store
+            .state
+            .lock()
+            .unwrap()
+            .rows
+            .insert(scan_id.to_string(), (status, at));
+        store
+    }
+
+    fn row_status(&self, scan_id: &str) -> Option<ReportEmailStatus> {
+        let state = self.state.lock().unwrap();
+        state.rows.get(scan_id).and_then(|row| row.0)
     }
 
     fn statuses(&self) -> Vec<(String, ReportEmailStatus)> {
@@ -92,6 +114,36 @@ impl ReportEmailStore for FakeStore {
         state
             .claim_times
             .insert(scan_id.to_string(), Instant::now());
+        Ok(Some(claimed(scan_id)))
+    }
+
+    async fn claim_for_queue(
+        &self,
+        scan_id: &str,
+        lease: Duration,
+    ) -> Result<Option<ClaimedReport>, RepoError> {
+        let mut state = self.state.lock().unwrap();
+        if state.fail_queue_claim {
+            return Err(RepoError::ConnectionFailed);
+        }
+        if !self.completed.iter().any(|s| s == scan_id) {
+            return Ok(None);
+        }
+        let now = Instant::now();
+        let (status, claimed_at) = state.rows.get(scan_id).copied().unwrap_or((None, None));
+        let leased = claimed_at.is_some_and(|at| now.duration_since(at) < lease);
+        let claimable = match status {
+            None => !leased,
+            Some(ReportEmailStatus::Pending | ReportEmailStatus::Failed) => !leased,
+            Some(ReportEmailStatus::Sent | ReportEmailStatus::Disabled) => false,
+        };
+        if !claimable {
+            return Ok(None);
+        }
+        state.rows.insert(
+            scan_id.to_string(),
+            (Some(ReportEmailStatus::Pending), Some(now)),
+        );
         Ok(Some(claimed(scan_id)))
     }
 
@@ -143,11 +195,11 @@ impl ReportEmailStore for FakeStore {
         status: ReportEmailStatus,
         _at: DateTime<Utc>,
     ) -> Result<(), RepoError> {
-        self.state
-            .lock()
-            .unwrap()
-            .statuses
-            .push((scan_id.to_string(), status));
+        let mut state = self.state.lock().unwrap();
+        state.statuses.push((scan_id.to_string(), status));
+        if let Some(row) = state.rows.get_mut(scan_id) {
+            row.0 = Some(status);
+        }
         Ok(())
     }
 
@@ -633,4 +685,168 @@ async fn a_slow_but_live_sender_is_never_taken_by_the_reaper_at_the_minimum() {
     assert_eq!(taken, 0, "the heartbeat gap stays under `after`");
     assert_eq!(mailer.sent(), 1);
     assert_eq!(store.last_status(), Some(ReportEmailStatus::Sent));
+}
+
+// --- Queue consumer: one attempt per receive (RF-20) ---
+
+const LEASE: Duration = Duration::from_secs(120);
+
+async fn handle(
+    service: &ReportEmailService,
+    receive_count: u32,
+    max_receives: u32,
+) -> QueueOutcome {
+    service
+        .handle_request("scan-1", receive_count, max_receives, LEASE)
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queue_request_sends_one_email_marks_sent_and_audits() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(mailer.sent().len(), 1);
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Sent));
+    assert_eq!(store.audit_actions(), [REPORT_EMAILED_ACTION]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transient_failure_before_the_last_receive_stays_pending_and_retries() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::failing_first(usize::MAX));
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Retry);
+    assert_eq!(mailer.attempts(), 1, "exactly one attempt per receive");
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Pending));
+    assert!(store.statuses().is_empty());
+    assert!(store.audit_actions().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_on_the_last_receive_marks_failed_audits_and_still_retries() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::failing_first(usize::MAX));
+
+    let outcome = handle(&service(&store, Some(&mailer)), 3, 3).await;
+
+    // Retry keeps the message, so the redrive policy moves it to the DLQ.
+    assert_eq!(outcome, QueueOutcome::Retry);
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Failed));
+    assert_eq!(store.audit_actions(), [REPORT_EMAIL_FAILED_ACTION]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_attempt_counts_as_a_failure_cut_at_the_deadline() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = SlowMailer::new(secs(3600), 0);
+    let service = service_with(&store, &mailer, retry(3, 5, 10));
+    let started = Instant::now();
+
+    let outcome = handle(&service, 2, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Retry);
+    assert_eq!(started.elapsed(), secs(10));
+    assert_eq!(mailer.attempts(), 1);
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Pending));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_attempt_on_the_last_receive_marks_failed() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = SlowMailer::new(secs(3600), 0);
+    let service = service_with(&store, &mailer, retry(3, 5, 10));
+
+    let outcome = handle(&service, 3, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Retry);
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Failed));
+    assert_eq!(store.audit_actions(), [REPORT_EMAIL_FAILED_ACTION]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_sent_report_is_done_without_sending() {
+    let store = FakeStore::with_row("scan-1", Some(ReportEmailStatus::Sent), false);
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(mailer.attempts(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_report_leased_by_another_consumer_is_done_without_sending() {
+    let store = FakeStore::with_row("scan-1", Some(ReportEmailStatus::Pending), true);
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(mailer.attempts(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_report_with_an_expired_lease_is_claimed_and_sent() {
+    let store = FakeStore::with_row("scan-1", Some(ReportEmailStatus::Pending), true);
+    let mailer = Arc::new(InMemoryMailer::default());
+    tokio::time::advance(LEASE + secs(1)).await;
+
+    let outcome = handle(&service(&store, Some(&mailer)), 2, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(mailer.sent().len(), 1);
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Sent));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_report_redriven_from_the_dlq_is_claimed_and_sent() {
+    let store = FakeStore::with_row("scan-1", Some(ReportEmailStatus::Failed), false);
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(store.row_status("scan-1"), Some(ReportEmailStatus::Sent));
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_mailer_the_queue_request_marks_disabled_and_is_done() {
+    let store = FakeStore::with_completed("scan-1");
+
+    let outcome = handle(&service(&store, None), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(
+        store.row_status("scan-1"),
+        Some(ReportEmailStatus::Disabled)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_scan_is_done_without_sending() {
+    let store = FakeStore::with_completed("other");
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Done);
+    assert_eq!(mailer.attempts(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_store_error_on_the_claim_is_retried() {
+    let store = FakeStore::with_completed("scan-1");
+    store.state.lock().unwrap().fail_queue_claim = true;
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let outcome = handle(&service(&store, Some(&mailer)), 1, 3).await;
+
+    assert_eq!(outcome, QueueOutcome::Retry);
+    assert_eq!(mailer.attempts(), 0);
 }

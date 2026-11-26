@@ -21,7 +21,7 @@ use user_service::domain::{
 };
 use user_service::report_email::mailer::{Mailer, MailerError, OutgoingEmail};
 use user_service::report_email::service::{
-    ReaperPolicy, ReportEmailService, ReportEmailStore, RetryPolicy,
+    QueueOutcome, ReaperPolicy, ReportEmailService, ReportEmailStore, RetryPolicy,
 };
 use user_service::report_email::smtp::{SmtpMailer, SmtpSettings, SmtpTls};
 use user_service::report_email::ReportAttachment;
@@ -691,4 +691,199 @@ async fn a_transient_owner_lookup_error_leaves_the_row_pending_without_an_audit(
         Some("pending")
     );
     assert_eq!(failed_audits(&db.pool).await, 0);
+}
+
+/// Forces the report email state of the scan, `age` ago when it has a claim.
+async fn set_report_state(pool: &PgPool, status: Option<&str>, age: Option<&str>) {
+    sqlx::query(
+        "UPDATE scan_history SET report_email_status = $1, \
+         report_email_claimed_at = now() - $2::interval",
+    )
+    .bind(status)
+    .bind(age)
+    .execute(pool)
+    .await
+    .expect("set state");
+}
+
+const LEASE: Duration = Duration::from_secs(120);
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_claims_a_scan_with_no_email_state_and_sets_the_lease() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+
+    let claim = repo.claim_for_queue("scan-1", LEASE).await.expect("claim");
+
+    assert_eq!(claim.expect("claimed").recipient, "owner@example.test");
+    assert_eq!(
+        report_email_status(&db.pool).await.as_deref(),
+        Some("pending")
+    );
+    let age: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM now() - report_email_claimed_at)::float8 FROM scan_history",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("age");
+    assert!(age < 60.0, "claim time is now: {age}s");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_refuses_a_live_lease_and_takes_over_an_expired_one() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+
+    set_report_state(&db.pool, Some("pending"), Some("10 seconds")).await;
+    assert!(repo
+        .claim_for_queue("scan-1", LEASE)
+        .await
+        .expect("claim")
+        .is_none());
+
+    set_report_state(&db.pool, Some("pending"), Some("10 minutes")).await;
+    assert!(repo
+        .claim_for_queue("scan-1", LEASE)
+        .await
+        .expect("claim")
+        .is_some());
+    // The takeover refreshed the lease: a second consumer is refused.
+    assert!(repo
+        .claim_for_queue("scan-1", LEASE)
+        .await
+        .expect("claim")
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_takes_a_pending_row_without_a_claim_time() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    set_report_state(&db.pool, Some("pending"), None).await;
+
+    assert!(repo
+        .claim_for_queue("scan-1", LEASE)
+        .await
+        .expect("claim")
+        .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_claims_a_failed_row_again() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    set_report_state(&db.pool, Some("failed"), Some("10 minutes")).await;
+
+    assert!(repo
+        .claim_for_queue("scan-1", LEASE)
+        .await
+        .expect("claim")
+        .is_some());
+    assert_eq!(
+        report_email_status(&db.pool).await.as_deref(),
+        Some("pending")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_never_claims_a_final_row() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+
+    for status in ["sent", "disabled"] {
+        set_report_state(&db.pool, Some(status), Some("10 hours")).await;
+        assert!(
+            repo.claim_for_queue("scan-1", LEASE)
+                .await
+                .expect("claim")
+                .is_none(),
+            "{status} is final"
+        );
+        assert_eq!(report_email_status(&db.pool).await.as_deref(), Some(status));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_ignores_a_scan_that_is_not_completed_or_unknown() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Fallido).await;
+
+    assert!(repo
+        .claim_for_queue("scan-1", LEASE)
+        .await
+        .expect("claim")
+        .is_none());
+    assert!(repo
+        .claim_for_queue("missing", LEASE)
+        .await
+        .expect("claim")
+        .is_none());
+    assert_eq!(report_email_status(&db.pool).await, None);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn two_concurrent_queue_claims_have_exactly_one_winner() {
+    let db = start_db().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+
+    let (a, b) = tokio::join!(
+        repo.claim_for_queue("scan-1", LEASE),
+        repo.claim_for_queue("scan-1", LEASE)
+    );
+
+    let wins = [a.expect("claim a"), b.expect("claim b")]
+        .into_iter()
+        .flatten()
+        .count();
+    assert_eq!(wins, 1);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn claim_for_queue_stores_failed_and_audits_a_row_whose_data_cannot_be_read() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    corrupt_scan_mode(&db.pool).await;
+
+    let claim = repo.claim_for_queue("scan-1", LEASE).await.expect("claim");
+
+    assert!(claim.is_none());
+    assert_eq!(
+        report_email_status(&db.pool).await.as_deref(),
+        Some("failed")
+    );
+    assert_eq!(failed_audits(&db.pool).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_queue_request_sends_the_email_once_and_a_duplicate_is_done_without_sending() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    let service = mailpit_service(&repo, &mailpit).await;
+
+    let first = service.handle_request("scan-1", 1, 3, LEASE).await;
+    let second = service.handle_request("scan-1", 2, 3, LEASE).await;
+
+    assert_eq!(first, QueueOutcome::Done);
+    assert_eq!(second, QueueOutcome::Done);
+    assert_eq!(mailpit.messages().await.len(), 1);
+    assert_eq!(report_email_status(&db.pool).await.as_deref(), Some("sent"));
 }
