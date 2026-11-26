@@ -85,7 +85,9 @@ pub fn parse_receive_count(raw: Option<&str>) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueSettings {
     /// The queue's `VisibilityTimeout`: how long a received message stays
-    /// hidden. It is also the claim lease.
+    /// hidden. It is NOT the claim lease: the lease is [`QueueSettings::lease`]
+    /// (90% of this), because the claim is made a moment after the receive and
+    /// a redelivery exactly one timeout later must find it expired.
     pub visibility_timeout: Duration,
     /// The redrive policy's `maxReceiveCount`: the receive that is the last one.
     pub max_receives: u32,
@@ -99,6 +101,42 @@ impl QueueSettings {
     /// far above one SMTP attempt (the visibility timeout must exceed it anyway).
     pub fn lease(&self) -> Duration {
         self.visibility_timeout.mul_f64(0.9)
+    }
+}
+
+/// The claim lease does not exceed one SMTP attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the queue lease ({} s, 90% of its visibility timeout) must be greater than one SMTP \
+     attempt deadline ({} s): raise the visibility timeout of the queue",
+    .lease.as_secs_f64(), .attempt_timeout.as_secs_f64()
+)]
+pub struct LeaseTooShortError {
+    /// The lease the queue gives a claim.
+    pub lease: Duration,
+    /// The SMTP attempt deadline of the retry policy in use.
+    pub attempt_timeout: Duration,
+}
+
+/// A claim must outlive one SMTP attempt, or the redelivery of a message that
+/// is still being sent would take the row over and send a second email.
+///
+/// # Errors
+///
+/// [`LeaseTooShortError`] when `settings.lease()` does not exceed
+/// `attempt_timeout`.
+pub fn check_lease_covers_attempt(
+    settings: &QueueSettings,
+    attempt_timeout: Duration,
+) -> Result<(), LeaseTooShortError> {
+    let lease = settings.lease();
+    if lease > attempt_timeout {
+        Ok(())
+    } else {
+        Err(LeaseTooShortError {
+            lease,
+            attempt_timeout,
+        })
     }
 }
 
@@ -186,9 +224,6 @@ pub enum PublishError {
     /// The queue refused or could not be reached.
     #[error("could not publish the report email request")]
     Failed(#[source] Box<dyn std::error::Error + Send + Sync>),
-    /// The queue did not answer in time.
-    #[error("publishing the report email request timed out")]
-    TimedOut,
 }
 
 /// Port: puts a [`ReportEmailRequest`] for a scan on the queue.
@@ -413,6 +448,33 @@ mod tests {
         assert_eq!(settings(120, 3).lease(), Duration::from_secs(108));
         assert_eq!(settings(2, 3).lease(), Duration::from_millis(1800));
         assert!(settings(1, 3).lease() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_lease_must_exceed_one_smtp_attempt() {
+        let attempt = Duration::from_secs(60);
+        // lease = 90% of the visibility timeout: 60 s -> 54 s.
+        let below = check_lease_covers_attempt(&settings(60, 3), attempt).unwrap_err();
+        assert_eq!(below.lease, Duration::from_secs(54));
+        assert_eq!(below.attempt_timeout, attempt);
+        assert!(check_lease_covers_attempt(&settings(120, 3), attempt).is_ok());
+    }
+
+    #[test]
+    fn a_lease_equal_to_the_attempt_deadline_is_refused() {
+        // 100 s x 0.9 = 90 s.
+        let attempt = Duration::from_secs(90);
+        assert!(check_lease_covers_attempt(&settings(100, 3), attempt).is_err());
+        assert!(check_lease_covers_attempt(&settings(101, 3), attempt).is_ok());
+    }
+
+    #[test]
+    fn the_lease_error_names_both_values() {
+        let error = check_lease_covers_attempt(&settings(60, 3), Duration::from_secs(60))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("54"), "{error}");
+        assert!(error.contains("60"), "{error}");
     }
 
     #[test]

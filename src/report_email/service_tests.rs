@@ -945,15 +945,3 @@ async fn without_a_publisher_the_in_process_send_runs_as_before() {
 
     assert_eq!(mailer.sent().len(), 1);
 }
-
-#[tokio::test(start_paused = true)]
-async fn a_failed_publish_without_a_service_does_nothing_more() {
-    let recording = Arc::new(RecordingPublisher::failing());
-    request_report_email(
-        Some(&publisher(&recording)),
-        None,
-        "scan-1".to_string(),
-        Duration::from_secs(5),
-    )
-    .await;
-}

@@ -40,7 +40,8 @@ use crate::messaging::kinesis::KinesisSecurityEventPublisher;
 use crate::messaging::sqs::{QueueSetupError, SqsReportEmailConsumer, SqsReportEmailPublisher};
 use crate::report_email::mailer::Mailer;
 use crate::report_email::queue::{
-    check_reaper_window, ReaperWindowError, ReportEmailRequestPublisher,
+    check_lease_covers_attempt, check_reaper_window, LeaseTooShortError, ReaperWindowError,
+    ReportEmailRequestPublisher,
 };
 use crate::report_email::service::{ReportEmailService, RetryPolicy};
 use crate::report_email::smtp::SmtpMailer;
@@ -148,10 +149,12 @@ async fn build_app_with_connect_timeout(
     let mailer = build_mailer(config);
     // The reaper retries sends lost to a shutdown or crash; it only runs when
     // email is enabled (it never starts without a mailer).
+    // One policy for the service, the API fallback and the startup checks.
+    let retry = RetryPolicy::default();
     let reaper = Arc::new(ReportEmailService::new(
         repository.clone(),
         mailer.clone(),
-        RetryPolicy::default(),
+        retry,
     ));
 
     // Queue mode: read the queue attributes first, so a reaper window that
@@ -170,12 +173,18 @@ async fn build_app_with_connect_timeout(
                 WiringError::ReportEmailQueueUnavailable(error)
             })?;
             let settings = consumer.settings();
+            check_lease_covers_attempt(&settings, retry.attempt_timeout).map_err(|source| {
+                WiringError::QueueLeaseTooShort {
+                    queue: urls.queue_url.clone(),
+                    source,
+                }
+            })?;
             // The reaper only runs with a mailer, so only then can it race.
             if mailer.is_some() {
                 check_reaper_window(
                     &settings,
                     config.report_email_reaper.after,
-                    RetryPolicy::default().attempt_timeout,
+                    retry.attempt_timeout,
                 )?;
             }
             tracing::info!(
@@ -202,7 +211,7 @@ async fn build_app_with_connect_timeout(
     let api_router = api::router_with_report_queue(
         repository,
         config.gateway_shared_secret.clone(),
-        Some((mailer, RetryPolicy::default())),
+        Some((mailer, retry)),
         report_publisher,
     );
     let health_router = Router::new()
@@ -320,6 +329,15 @@ pub enum WiringError {
     /// The report email queue could not be read or is not usable at startup.
     #[error("la cola del correo del informe no está disponible: {0}")]
     ReportEmailQueueUnavailable(#[from] QueueSetupError),
+    /// The lease of the queue does not exceed one SMTP attempt.
+    #[error("la cola {queue} no sirve para el correo del informe: {source}")]
+    QueueLeaseTooShort {
+        /// URL of the queue.
+        queue: String,
+        /// The values compared.
+        #[source]
+        source: LeaseTooShortError,
+    },
     /// `REPORT_EMAIL_REAPER_AFTER_SECS` does not outlast the queue window.
     #[error("{0}")]
     ReaperWindowTooShort(#[from] ReaperWindowError),

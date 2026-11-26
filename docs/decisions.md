@@ -196,7 +196,9 @@ broker y `tests/kinesis_publisher_localstack.rs` /
   tiene que encontrar la concesión vencida, o el reintento se tomaría por un
   duplicado y se borraría), el umbral de última recepción y la ventana que debe
   superar el reaper (`VisibilityTimeout` x `maxReceiveCount` + plazo del intento).
-  Terraform queda como único sitio donde se cambian; una cola sin DLQ o sin
+  El arranque también falla si la concesión no supera el plazo de un intento SMTP
+  (la política de reintentos en uso), pues una reentrega podría tomar un envío
+  vivo. Terraform queda como único sitio donde se cambian; una cola sin DLQ o sin
   visibilidad hace fallar el arranque.
 - **Un mensaje por recepción:** un intento puede tardar 60 s y los mensajes de un
   lote se procesan en serie; con 10 por lote los últimos superarían la
