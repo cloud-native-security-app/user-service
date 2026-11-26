@@ -23,10 +23,12 @@ pub mod repository;
 pub mod security_events;
 pub mod wiring;
 
+use tokio_util::sync::CancellationToken;
+
 /// Arranca el servicio `ms-usuarios`.
 ///
 /// Composition root del servicio: carga la [`config::Config`] desde
-/// variables de entorno, delega en [`wiring::build_router`] la aplicación
+/// variables de entorno, delega en [`wiring::build_app`] la aplicación
 /// de migraciones y el ensamblado del router `axum` completo (perfil,
 /// histórico, auditoría y `GET /health`), y pone el servidor HTTP a
 /// escuchar en `Config::http_host`/`Config::http_port`.
@@ -41,13 +43,65 @@ pub mod wiring;
 /// Ver [`RunError`] para el detalle de cada causa posible.
 pub async fn run() -> Result<(), RunError> {
     let config = config::Config::from_env()?;
-    let app = wiring::build_router(&config).await?;
+    let shutdown = CancellationToken::new();
+    let wiring::App { router, consumer } = wiring::build_app(&config, shutdown.clone()).await?;
 
     let listener = tokio::net::TcpListener::bind((config.http_host.as_str(), config.http_port))
         .await
         .map_err(RunError::Bind)?;
 
-    axum::serve(listener, app).await.map_err(RunError::Serve)
+    let signal_token = shutdown.clone();
+    let served = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!(
+                "shutdown signal received: stopping the HTTP server and the queue consumer"
+            );
+            signal_token.cancel();
+        })
+        .await;
+
+    // Also reached when the server fails: stop the consumer and let an
+    // in-flight email finish before the process exits.
+    shutdown.cancel();
+    if let Some(consumer) = consumer {
+        if consumer.await.is_err() {
+            tracing::error!("the report email consumer task ended abnormally");
+        }
+    }
+    served.map_err(RunError::Serve)
+}
+
+/// Completes on Ctrl-C (`SIGINT`) or, on Unix, `SIGTERM` (what ECS sends to
+/// stop a task). If a handler cannot be installed it is logged and that path
+/// stays inactive (the other one still works).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "could not install the Ctrl-C handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not install the SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
 
 /// Error devuelto por [`run`] cuando el servicio no puede arrancar.

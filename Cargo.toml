@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 axum = "0.7"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "json"] }
 tracing = "0.1"
@@ -32,6 +32,12 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 # cadena por defecto de AWS (rol de la tarea ECS), sin claves estáticas.
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
 aws-sdk-kinesis = "1.125.0"
+# Report email queue (`src/messaging/sqs.rs`, RF-20). `aws-sdk-sqs` 1.114.0 is the
+# same pin as gateway and nmap-service: it is the last release that accepts the
+# `aws-runtime` 1.10.0 / `aws-smithy-runtime` 1.16.0 those services already pin.
+# `tokio-util` provides the `CancellationToken` that stops the consumer loop.
+aws-sdk-sqs = "1.114.0"
+tokio-util = "0.7"
 
 [dev-dependencies]
 testcontainers = "0.27"

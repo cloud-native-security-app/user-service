@@ -850,3 +850,110 @@ async fn a_store_error_on_the_claim_is_retried() {
     assert_eq!(outcome, QueueOutcome::Retry);
     assert_eq!(mailer.attempts(), 0);
 }
+
+// --- Queue producer: publish, or fall back to the in-process path ---
+
+use super::queue::{request_report_email, RecordingPublisher, ReportEmailRequestPublisher};
+
+fn publisher(recording: &Arc<RecordingPublisher>) -> Arc<dyn ReportEmailRequestPublisher> {
+    recording.clone()
+}
+
+/// Lets a spawned `spawn_for_completed` task run to completion.
+async fn settle() {
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_published_request_does_not_start_the_in_process_send() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::default());
+    let service = service(&store, Some(&mailer));
+    let recording = Arc::new(RecordingPublisher::default());
+
+    request_report_email(
+        Some(&publisher(&recording)),
+        Some(&service),
+        "scan-1".to_string(),
+        Duration::from_secs(5),
+    )
+    .await;
+    settle().await;
+
+    assert_eq!(recording.published(), ["scan-1"]);
+    assert_eq!(mailer.attempts(), 0);
+    assert_eq!(store.row_status("scan-1"), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_publish_falls_back_to_the_in_process_send() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::default());
+    let service = service(&store, Some(&mailer));
+    let recording = Arc::new(RecordingPublisher::failing());
+
+    request_report_email(
+        Some(&publisher(&recording)),
+        Some(&service),
+        "scan-1".to_string(),
+        Duration::from_secs(5),
+    )
+    .await;
+    settle().await;
+
+    assert_eq!(mailer.sent().len(), 1);
+    assert_eq!(store.last_status(), Some(ReportEmailStatus::Sent));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_publish_that_hangs_is_cut_off_and_falls_back() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::default());
+    let service = service(&store, Some(&mailer));
+    let recording = Arc::new(RecordingPublisher::hanging());
+    let started = Instant::now();
+
+    request_report_email(
+        Some(&publisher(&recording)),
+        Some(&service),
+        "scan-1".to_string(),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    settle().await;
+
+    assert_eq!(mailer.sent().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_publisher_the_in_process_send_runs_as_before() {
+    let store = FakeStore::with_completed("scan-1");
+    let mailer = Arc::new(InMemoryMailer::default());
+    let service = service(&store, Some(&mailer));
+
+    request_report_email(
+        None,
+        Some(&service),
+        "scan-1".to_string(),
+        Duration::from_secs(5),
+    )
+    .await;
+    settle().await;
+
+    assert_eq!(mailer.sent().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_publish_without_a_service_does_nothing_more() {
+    let recording = Arc::new(RecordingPublisher::failing());
+    request_report_email(
+        Some(&publisher(&recording)),
+        None,
+        "scan-1".to_string(),
+        Duration::from_secs(5),
+    )
+    .await;
+}

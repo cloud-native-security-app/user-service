@@ -3,6 +3,8 @@
 //! `testcontainers`. Marked `#[ignore = "requiere Docker"]`: run them with
 //! `cargo test -- --ignored` (`make test-integration`).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,10 +18,15 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 
+use tokio_util::sync::CancellationToken;
 use user_service::domain::{
     ReportEmailStatus, Role, ScanHistoryEntry, ScanMode, ScanStatus, UserProfile,
 };
-use user_service::report_email::mailer::{Mailer, MailerError, OutgoingEmail};
+use user_service::messaging::sqs::{
+    load_queue_settings, SqsReportEmailConsumer, SqsReportEmailPublisher,
+};
+use user_service::report_email::mailer::{InMemoryMailer, Mailer, MailerError, OutgoingEmail};
+use user_service::report_email::queue::{RecordingPublisher, ReportEmailRequestPublisher};
 use user_service::report_email::service::{
     QueueOutcome, ReaperPolicy, ReportEmailService, ReportEmailStore, RetryPolicy,
 };
@@ -886,4 +893,315 @@ async fn a_queue_request_sends_the_email_once_and_a_duplicate_is_done_without_se
     assert_eq!(second, QueueOutcome::Done);
     assert_eq!(mailpit.messages().await.len(), 1);
     assert_eq!(report_email_status(&db.pool).await.as_deref(), Some("sent"));
+}
+
+// --- Report email queue (RF-20): LocalStack SQS + Postgres + Mailpit ---
+
+/// Visibility timeout of the test queue: small, so redeliveries are quick.
+const TEST_VISIBILITY_SECS: u32 = 2;
+const TEST_MAX_RECEIVES: u32 = 3;
+
+struct QueueRig {
+    localstack: common::LocalStack,
+    urls: common::QueueUrls,
+    publisher: SqsReportEmailPublisher,
+}
+
+async fn start_queue() -> QueueRig {
+    let localstack = common::LocalStack::start().await;
+    let urls = localstack
+        .create_queue_with_dlq(
+            "user-service-report-emails",
+            TEST_VISIBILITY_SECS,
+            TEST_MAX_RECEIVES,
+        )
+        .await;
+    let publisher =
+        SqsReportEmailPublisher::from_client(localstack.sqs.clone(), urls.queue_url.clone());
+    QueueRig {
+        localstack,
+        urls,
+        publisher,
+    }
+}
+
+struct RunningConsumer {
+    shutdown: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RunningConsumer {
+    async fn stop(self) {
+        self.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .expect("the consumer stops promptly on cancellation")
+            .expect("the consumer task does not panic");
+    }
+}
+
+async fn spawn_consumer(rig: &QueueRig, service: Arc<ReportEmailService>) -> RunningConsumer {
+    let client = rig.localstack.sqs.clone();
+    let settings = load_queue_settings(&client, &rig.urls.queue_url)
+        .await
+        .expect("queue attributes");
+    assert_eq!(
+        settings.visibility_timeout,
+        Duration::from_secs(TEST_VISIBILITY_SECS.into())
+    );
+    assert_eq!(settings.max_receives, TEST_MAX_RECEIVES);
+    let consumer = SqsReportEmailConsumer::from_client(
+        client,
+        rig.urls.queue_url.clone(),
+        rig.urls.dlq_url.clone(),
+        settings,
+    );
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(consumer.run(service, shutdown.clone()));
+    RunningConsumer { shutdown, task }
+}
+
+/// Bodies that reach the DLQ within `secs` seconds; panics if none does.
+async fn dlq_bodies(rig: &QueueRig, secs: u32) -> Vec<String> {
+    for _ in 0..secs {
+        let bodies = rig.localstack.receive_bodies(&rig.urls.dlq_url, 1).await;
+        if !bodies.is_empty() {
+            return bodies;
+        }
+    }
+    panic!("nothing reached the DLQ in {secs}s");
+}
+
+/// Polls `condition` every 200 ms for up to `secs` seconds.
+async fn eventually<F, Fut>(secs: u64, what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..(secs * 5) {
+        if condition().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_published_request_emails_the_owner_once_and_the_message_is_deleted() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let rig = start_queue().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    let consumer = spawn_consumer(&rig, mailpit_service(&repo, &mailpit).await).await;
+
+    rig.publisher.publish("scan-1").await.expect("publish");
+
+    eventually(30, "the email in Mailpit", || async {
+        mailpit.messages().await.len() == 1
+    })
+    .await;
+    eventually(15, "the message deleted", || async {
+        rig.localstack.queue_depth(&rig.urls.queue_url).await == 0
+    })
+    .await;
+    assert_eq!(
+        mailpit.messages().await[0]["To"][0]["Address"],
+        "owner@example.test"
+    );
+    assert_eq!(
+        history_entry(&repo).await.report_email_status,
+        Some(ReportEmailStatus::Sent)
+    );
+    assert_eq!(rig.localstack.queue_depth(&rig.urls.dlq_url).await, 0);
+    consumer.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_duplicate_request_sends_one_email() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let rig = start_queue().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    let consumer = spawn_consumer(&rig, mailpit_service(&repo, &mailpit).await).await;
+
+    rig.publisher.publish("scan-1").await.expect("publish");
+    rig.publisher
+        .publish("scan-1")
+        .await
+        .expect("publish again");
+
+    eventually(30, "both messages consumed", || async {
+        rig.localstack.queue_depth(&rig.urls.queue_url).await == 0
+    })
+    .await;
+    // Let a (wrong) second send show up before asserting there is only one.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(mailpit.messages().await.len(), 1);
+    let audit = repo.list_audit_entries("owner-sub").await.expect("audit");
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|e| e.action() == "report.emailed")
+            .count(),
+        1
+    );
+    consumer.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_malformed_message_goes_to_the_dlq_and_leaves_the_queue() {
+    let db = start_db().await;
+    let mailpit = start_mailpit().await;
+    let rig = start_queue().await;
+    let repo = Arc::new(repository(&db.pool));
+    let consumer = spawn_consumer(&rig, mailpit_service(&repo, &mailpit).await).await;
+    let body = r#"{"scan_id":"scan-1","unexpected":true}"#;
+
+    rig.localstack
+        .sqs
+        .send_message()
+        .queue_url(&rig.urls.queue_url)
+        .message_body(body)
+        .send()
+        .await
+        .expect("send");
+
+    let dlq = dlq_bodies(&rig, 30).await;
+    assert_eq!(dlq, [body]);
+    eventually(15, "the queue empty", || async {
+        rig.localstack.queue_depth(&rig.urls.queue_url).await == 0
+    })
+    .await;
+    assert!(mailpit.messages().await.is_empty());
+    consumer.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn a_failing_mailer_is_retried_by_the_queue_then_fails_the_row_and_redrives_to_the_dlq() {
+    let db = start_db().await;
+    let rig = start_queue().await;
+    let repo = Arc::new(repository(&db.pool));
+    seed_scan(&repo, "scan-1", ScanStatus::Completado).await;
+    let mailer = Arc::new(InMemoryMailer::failing_first(usize::MAX));
+    let service = Arc::new(ReportEmailService::new(
+        repo.clone(),
+        Some(mailer.clone() as Arc<dyn Mailer>),
+        RetryPolicy::default(),
+    ));
+    let consumer = spawn_consumer(&rig, service).await;
+
+    rig.publisher.publish("scan-1").await.expect("publish");
+
+    // One attempt per receive: three receives, three attempts, then `failed`.
+    eventually(60, "the row marked failed", || async {
+        history_entry(&repo).await.report_email_status == Some(ReportEmailStatus::Failed)
+    })
+    .await;
+    assert_eq!(mailer.attempts(), TEST_MAX_RECEIVES as usize);
+    let dlq = dlq_bodies(&rig, 30).await;
+    assert!(dlq[0].contains("scan-1"));
+    let audit = repo.list_audit_entries("owner-sub").await.expect("audit");
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|e| e.action() == "report.email_failed")
+            .count(),
+        1
+    );
+    consumer.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn cancelling_the_token_stops_the_consumer_during_a_long_poll() {
+    let db = start_db().await;
+    let rig = start_queue().await;
+    let repo = Arc::new(repository(&db.pool));
+    let service = Arc::new(ReportEmailService::new(repo, None, RetryPolicy::default()));
+    let consumer = spawn_consumer(&rig, service).await;
+    // Let it enter the 20 s long poll on the empty queue.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    consumer.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patching_to_completed_publishes_a_request_without_sending_in_process() {
+    let db = start_db().await;
+    let rig = start_queue().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::EnProgreso).await;
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let publisher: Arc<dyn ReportEmailRequestPublisher> = Arc::new(rig.publisher.clone());
+    patch_completed(repo, mailer.clone(), Some(publisher)).await;
+
+    let bodies = rig.localstack.receive_bodies(&rig.urls.queue_url, 5).await;
+    assert_eq!(bodies.len(), 1);
+    let request: Value = serde_json::from_str(&bodies[0]).expect("json");
+    assert_eq!(request["scan_id"], "scan-1");
+    assert!(request["requested_at"].is_string());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(mailer.attempts(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn patching_to_completed_falls_back_to_the_in_process_send_when_the_publish_fails() {
+    let db = start_db().await;
+    let repo = repository(&db.pool);
+    seed_scan(&repo, "scan-1", ScanStatus::EnProgreso).await;
+    let mailer = Arc::new(InMemoryMailer::default());
+
+    let publisher: Arc<dyn ReportEmailRequestPublisher> = Arc::new(RecordingPublisher::failing());
+    patch_completed(repo, mailer.clone(), Some(publisher)).await;
+
+    eventually(15, "the in-process email", || async {
+        mailer.sent().len() == 1
+    })
+    .await;
+}
+
+/// `PATCH /scans/scan-1` with `COMPLETADO` through a router with `publisher`.
+async fn patch_completed(
+    repo: Repository,
+    mailer: Arc<InMemoryMailer>,
+    publisher: Option<Arc<dyn ReportEmailRequestPublisher>>,
+) {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use user_service::api::{self, FORWARDED_USER_HEADER, GATEWAY_SECRET_HEADER};
+
+    let app = api::router_with_report_queue(
+        Arc::new(repo),
+        "gateway-secret".to_string().into(),
+        Some((Some(mailer as Arc<dyn Mailer>), RetryPolicy::default())),
+        publisher,
+    );
+    let identity = json!({"sub": "owner-sub", "email": "owner@example.test"}).to_string();
+    let result = json!({
+        "host": "192.0.2.10", "ports": [], "vulnerabilities": [],
+        "scanned_at": "2026-11-20T15:30:00Z"
+    });
+    let request = Request::builder()
+        .method("PATCH")
+        .uri("/scans/scan-1")
+        .header(GATEWAY_SECRET_HEADER, "gateway-secret")
+        .header(FORWARDED_USER_HEADER, &identity)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"status": "COMPLETADO", "result": result}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.expect("patch");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }

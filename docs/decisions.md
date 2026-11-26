@@ -173,3 +173,51 @@ broker y `tests/kinesis_publisher_localstack.rs` /
   (`tests/repository.rs`, `tests/api.rs`) fijan el round trip para que un futuro
   modelo tipado de `result` no descarte los campos. Si el almacenamiento pasara
   a ser columnar, habría que añadir las columnas con una migración aditiva.
+
+## ADR-016 Correo del informe por SQS, con el consumidor en user-service
+
+- **Decisión:** con `REPORT_EMAIL_QUEUE_URL` y `REPORT_EMAIL_DLQ_URL`, el
+  `PATCH /scans/{id}` con `COMPLETADO` publica un `ReportEmailRequest`
+  (`{scan_id, requested_at}`, contrato `report-email-request.schema.json` del
+  broker, D-19) en la cola `user-service-report-emails` y un consumidor dentro
+  de este servicio (`src/messaging/sqs.rs`, hecho a imagen de `gateway/src/sqs.rs`)
+  lo procesa. Sin esas variables el envío en proceso queda igual (RF-20).
+- **Un intento por recepción:** cada recepción reclama la fila en Postgres
+  (`claim_for_queue`, con una concesión), hace un único intento SMTP de 60 s y
+  devuelve `Done` (se borra el mensaje) o `Retry` (se deja: SQS lo reentrega al
+  vencer la visibilidad). En la última recepción, la fila pasa a `failed` con
+  auditoría y el mensaje no se borra, de modo que la redrive policy lo mueve a la
+  DLQ, donde se puede inspeccionar y reenviar. Los reintentos viven en SQS, no en
+  memoria.
+- **Atributos leídos al arrancar:** `GetQueueAttributes` entrega
+  `VisibilityTimeout` y el `maxReceiveCount` de la `RedrivePolicy`. De ellos salen
+  la concesión (90 % de la visibilidad: la reclamación ocurre un instante después
+  de la recepción, así que una reentrega exactamente una visibilidad después
+  tiene que encontrar la concesión vencida, o el reintento se tomaría por un
+  duplicado y se borraría), el umbral de última recepción y la ventana que debe
+  superar el reaper (`VisibilityTimeout` x `maxReceiveCount` + plazo del intento).
+  Terraform queda como único sitio donde se cambian; una cola sin DLQ o sin
+  visibilidad hace fallar el arranque.
+- **Un mensaje por recepción:** un intento puede tardar 60 s y los mensajes de un
+  lote se procesan en serie; con 10 por lote los últimos superarían la
+  visibilidad, se reentregarían con la cuenta de recepciones incrementada sin
+  haberse procesado y podrían marcar `failed` antes de tiempo.
+- **Respaldo en proceso:** si la publicación falla o supera 5 s, se registra un
+  aviso (sin cuerpo ni secretos) y se lanza `spawn_for_completed`, de modo que el
+  correo no se pierde y el `PATCH` no queda bloqueado más que ese tope. El reaper
+  se mantiene para esa ruta.
+- **Al menos una vez:** SQS puede duplicar y el consumidor puede morir tras enviar;
+  la reclamación atómica en Postgres (estado y marca de tiempo) es la
+  idempotencia: `sent` y `disabled` son finales y una concesión viva no se toma.
+  El correo solo se duplica si el proceso muere tras el envío y antes de guardar
+  `sent`, igual que antes.
+- **Malformados:** se copian a la DLQ con un `SendMessage` explícito y se borran;
+  el cuerpo nunca se loguea (solo largo e id del mensaje). Si la copia falla se
+  deja el mensaje para que lo resuelva la redrive.
+- **Apagado:** un `CancellationToken` se cancela con SIGTERM o Ctrl-C (también
+  detiene el servidor HTTP con `with_graceful_shutdown`); corta el long poll y el
+  backoff, el correo en curso termina y el proceso espera la tarea del consumidor
+  antes de salir. Los mensajes sin procesar reaparecen al vencer su visibilidad.
+- **Consecuencia:** el correo tarda al menos una visibilidad (~2 min) más por cada
+  reintento. Los tests viven en `tests/report_email.rs` (LocalStack, Postgres y
+  Mailpit) y `tests/report_email_request_contract.rs`.
