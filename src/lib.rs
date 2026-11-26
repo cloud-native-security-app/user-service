@@ -86,7 +86,8 @@ pub async fn run() -> Result<(), RunError> {
 /// How the report email consumer task ended.
 #[derive(Debug, PartialEq, Eq)]
 enum ConsumerEnd {
-    /// It stopped because `shutdown` was cancelled.
+    /// It ended after `shutdown` was cancelled. A panic at that point is only
+    /// logged: the process is already stopping.
     Stopped,
     /// It ended (panic or return) while the service was still running.
     Died,
@@ -164,8 +165,9 @@ pub enum RunError {
     /// El servidor HTTP terminó con un error durante su ejecución.
     #[error("el servidor HTTP terminó con un error: {0}")]
     Serve(std::io::Error),
-    /// The report email queue consumer ended while the service was running.
-    #[error("the report email queue consumer stopped unexpectedly")]
+    /// El consumidor de la cola de correos de reporte terminó mientras el
+    /// servicio seguía corriendo.
+    #[error("el consumidor de la cola de correos de reporte se detuvo inesperadamente")]
     ConsumerDied,
 }
 
