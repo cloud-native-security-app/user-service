@@ -220,6 +220,11 @@ broker y `tests/kinesis_publisher_localstack.rs` /
   detiene el servidor HTTP con `with_graceful_shutdown`); corta el long poll y el
   backoff, el correo en curso termina y el proceso espera la tarea del consumidor
   antes de salir. Los mensajes sin procesar reaparecen al vencer su visibilidad.
+- **Consumidor caído:** si la tarea del consumidor termina (panic o retorno)
+  mientras el servicio sigue corriendo, `run` lo registra, cancela el mismo token
+  (el servidor HTTP se detiene) y falla con `RunError::ConsumerDied`; el proceso
+  sale con código 1 y ECS lo reemplaza, en vez de seguir sirviendo HTTP sin nadie
+  que consuma la cola.
 - **Consecuencia:** el correo tarda al menos una visibilidad (~2 min) más por cada
   reintento. Los tests viven en `tests/report_email.rs` (LocalStack, Postgres y
   Mailpit) y `tests/report_email_request_contract.rs`.
