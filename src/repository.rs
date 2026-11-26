@@ -780,6 +780,38 @@ impl ReportEmailStore for Repository {
         }
     }
 
+    /// One atomic `UPDATE ... RETURNING` claims a row with no live lease: in no
+    /// state yet, or `pending`/`failed` with a missing or expired claim time.
+    /// A row whose stored data cannot be read is stored `failed` and audited by
+    /// `claimed_outcome`, and reported as nothing to send.
+    async fn claim_for_queue(
+        &self,
+        scan_id: &str,
+        lease: Duration,
+    ) -> Result<Option<ClaimedReport>, RepoError> {
+        let row: Option<ClaimedRow> = sqlx::query_as(
+            "UPDATE scan_history SET report_email_status = 'pending', \
+             report_email_claimed_at = now() \
+             WHERE scan_id = $1 AND status = 'COMPLETADO' \
+               AND (report_email_status IS NULL \
+                    OR (report_email_status IN ('pending', 'failed') \
+                        AND (report_email_claimed_at IS NULL \
+                             OR report_email_claimed_at < now() - make_interval(secs => $2)))) \
+             RETURNING scan_id, user_id, target, scan_mode, result, updated_at",
+        )
+        .bind(scan_id)
+        .bind(lease.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => match self.claimed_outcome(row).await? {
+                ClaimedOutcome::Ready(report) => Ok(Some(report)),
+                ClaimedOutcome::Unreadable(_) => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
     /// Re-claims up to `limit` `pending` rows whose claim is older than
     /// `older_than`. `FOR UPDATE SKIP LOCKED` plus the refreshed
     /// `report_email_claimed_at` make it atomic: a concurrent tick or instance
@@ -869,7 +901,21 @@ type ClaimedRow = (
     chrono::DateTime<chrono::Utc>,
 );
 
+/// Result of reading a claimed row: ready to send, or unreadable and already
+/// stored `failed` (carries the error `claimed_report` returns for it).
+enum ClaimedOutcome {
+    Ready(ClaimedReport),
+    Unreadable(RepoError),
+}
+
 impl Repository {
+    async fn claimed_report(&self, row: ClaimedRow) -> Result<ClaimedReport, RepoError> {
+        match self.claimed_outcome(row).await? {
+            ClaimedOutcome::Ready(report) => Ok(report),
+            ClaimedOutcome::Unreadable(error) => Err(error),
+        }
+    }
+
     /// Builds the [`ClaimedReport`] of a claimed row. The recipient is always
     /// the owner's account email, read from `users`.
     ///
@@ -878,7 +924,7 @@ impl Repository {
     /// up again. A transient database error is returned with the row still
     /// `pending`: the reaper retries it after the threshold, and each failure is
     /// logged by the caller.
-    async fn claimed_report(&self, row: ClaimedRow) -> Result<ClaimedReport, RepoError> {
+    async fn claimed_outcome(&self, row: ClaimedRow) -> Result<ClaimedOutcome, RepoError> {
         let (scan_id, user_id, target, scan_mode, result, finished_at) = row;
         let Some(mode) = ScanMode::from_db_str(&scan_mode) else {
             return self
@@ -888,7 +934,8 @@ impl Repository {
                     RepoError::Backend,
                     "unreadable stored scan_mode",
                 )
-                .await;
+                .await
+                .map(ClaimedOutcome::Unreadable);
         };
         let Some(owner) = self.find_user(&user_id).await? else {
             return self
@@ -898,9 +945,10 @@ impl Repository {
                     RepoError::NotFound,
                     "owner account not found",
                 )
-                .await;
+                .await
+                .map(ClaimedOutcome::Unreadable);
         };
-        Ok(ClaimedReport {
+        Ok(ClaimedOutcome::Ready(ClaimedReport {
             scan_id,
             user_id,
             recipient: owner.email,
@@ -908,13 +956,13 @@ impl Repository {
             mode,
             finished_at,
             result,
-        })
+        }))
     }
 }
 
 impl Repository {
     /// Stores `failed` and the failure audit entry for a claimed report whose
-    /// data can never be sent, in one transaction, then returns `error`.
+    /// data can never be sent, in one transaction, then returns `Ok(error)`.
     ///
     /// If either write fails nothing is stored: the row stays `pending` with
     /// no audit entry and the reaper retries it after the threshold.
@@ -924,7 +972,7 @@ impl Repository {
         user_id: &str,
         error: RepoError,
         reason: &'static str,
-    ) -> Result<ClaimedReport, RepoError> {
+    ) -> Result<RepoError, RepoError> {
         let entry = AuditEntry::new(
             uuid::Uuid::new_v4().to_string(),
             user_id,
@@ -958,7 +1006,7 @@ impl Repository {
             reason,
             "report email: cannot be sent, marked failed"
         );
-        Err(error)
+        Ok(error)
     }
 }
 

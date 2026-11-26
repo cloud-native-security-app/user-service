@@ -87,6 +87,9 @@ use crate::domain::{
     ScanStatus, UserProfile,
 };
 use crate::report_email::mailer::Mailer;
+use crate::report_email::queue::{
+    request_report_email, ReportEmailRequestPublisher, PUBLISH_TIMEOUT,
+};
 use crate::report_email::service::{ReportEmailService, RetryPolicy};
 use crate::repository::{parse_target, RepoError, Repository};
 
@@ -117,6 +120,9 @@ struct AppState {
     /// Sends the report email when a scan completes; `None` skips it entirely
     /// (no claim, no status), which is what plain [`router`] does.
     report_email: Option<Arc<ReportEmailService>>,
+    /// Publishes the report email request to the queue (queue mode); `None`
+    /// sends in process.
+    report_publisher: Option<Arc<dyn ReportEmailRequestPublisher>>,
 }
 
 /// Construye el router `axum` del perfil de usuario.
@@ -151,6 +157,19 @@ pub fn router_with_shared_repository(
     gateway_shared_secret: SecretString,
     report_email: Option<(Option<Arc<dyn Mailer>>, RetryPolicy)>,
 ) -> Router {
+    router_with_report_queue(repository, gateway_shared_secret, report_email, None)
+}
+
+/// Same as [`router_with_shared_repository`], plus the report email queue: with
+/// a `report_publisher`, a `COMPLETADO` update publishes a request instead of
+/// sending in process, and falls back to the in-process send if the publish
+/// fails or takes longer than [`PUBLISH_TIMEOUT`].
+pub fn router_with_report_queue(
+    repository: Arc<Repository>,
+    gateway_shared_secret: SecretString,
+    report_email: Option<(Option<Arc<dyn Mailer>>, RetryPolicy)>,
+    report_publisher: Option<Arc<dyn ReportEmailRequestPublisher>>,
+) -> Router {
     let report_email = report_email.map(|(mailer, retry)| {
         Arc::new(ReportEmailService::new(repository.clone(), mailer, retry))
     });
@@ -158,6 +177,7 @@ pub fn router_with_shared_repository(
         repository,
         gateway_shared_secret: Arc::new(gateway_shared_secret),
         report_email,
+        report_publisher,
     };
 
     Router::new()
@@ -499,12 +519,17 @@ async fn patch_scan_status(
         .await
     {
         Ok(()) => {
-            // Fire and forget: the claim makes a redelivered outcome a no-op,
-            // and nothing here can fail or delay the update.
+            // The email never fails the update: the request goes to the queue
+            // (bounded wait) or, if that is not possible, to the in-process
+            // task. A redelivered outcome is a no-op through the claim.
             if payload.status == ScanStatus::Completado {
-                if let Some(report_email) = &state.report_email {
-                    report_email.spawn_for_completed(scan_id);
-                }
+                request_report_email(
+                    state.report_publisher.as_ref(),
+                    state.report_email.as_ref(),
+                    scan_id,
+                    PUBLISH_TIMEOUT,
+                )
+                .await;
             }
             Ok(StatusCode::NO_CONTENT)
         }

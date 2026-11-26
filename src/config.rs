@@ -71,6 +71,14 @@ pub const REPORT_EMAIL_REAPER_AFTER_SECS_VAR: &str = "REPORT_EMAIL_REAPER_AFTER_
 /// Optional seconds between reaper ticks (default 60).
 pub const REPORT_EMAIL_REAPER_INTERVAL_SECS_VAR: &str = "REPORT_EMAIL_REAPER_INTERVAL_SECS";
 
+/// Optional URL of the SQS queue that carries the report email requests
+/// (queue mode). Set together with [`REPORT_EMAIL_DLQ_URL_VAR`] or not at all.
+pub const REPORT_EMAIL_QUEUE_URL_VAR: &str = "REPORT_EMAIL_QUEUE_URL";
+/// Optional URL of the dead-letter queue of the report email queue, where
+/// malformed messages are forwarded. Set together with
+/// [`REPORT_EMAIL_QUEUE_URL_VAR`] or not at all.
+pub const REPORT_EMAIL_DLQ_URL_VAR: &str = "REPORT_EMAIL_DLQ_URL";
+
 /// Optional SMTP host of the report email. Unset or blank disables the email.
 pub const SMTP_HOST_VAR: &str = "SMTP_HOST";
 /// Optional SMTP port (default 587).
@@ -149,6 +157,18 @@ pub struct Config {
     /// Threshold, interval and batch of the reaper that retries report emails
     /// stuck in `pending`. Only used when SMTP is configured.
     pub report_email_reaper: ReaperPolicy,
+    /// URLs of the report email queue and its DLQ; `None` keeps the in-process
+    /// send. Both variables or neither (see [`REPORT_EMAIL_QUEUE_URL_VAR`]).
+    pub report_email_queue: Option<ReportEmailQueueUrls>,
+}
+
+/// The queue and the dead-letter queue of the report email (queue mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportEmailQueueUrls {
+    /// URL of the queue the producer publishes to and the consumer reads.
+    pub queue_url: String,
+    /// URL of the DLQ that receives malformed messages.
+    pub dlq_url: String,
 }
 
 impl fmt::Debug for Config {
@@ -178,6 +198,7 @@ impl fmt::Debug for Config {
             .field("aws_endpoint_url", &self.aws_endpoint_url)
             .field("smtp", &self.smtp)
             .field("report_email_reaper", &self.report_email_reaper)
+            .field("report_email_queue", &self.report_email_queue)
             .finish()
     }
 }
@@ -241,6 +262,7 @@ impl Config {
 
         let smtp = read_smtp(&lookup)?;
         let report_email_reaper = read_reaper(&lookup)?;
+        let report_email_queue = read_report_email_queue(&lookup)?;
 
         let http_port = raw_http_port
             .parse::<u16>()
@@ -262,6 +284,7 @@ impl Config {
             aws_endpoint_url,
             smtp,
             report_email_reaper,
+            report_email_queue,
         })
     }
 }
@@ -368,6 +391,26 @@ fn read_reaper(lookup: &impl Fn(&str) -> Option<OsString>) -> Result<ReaperPolic
         interval: seconds(REPORT_EMAIL_REAPER_INTERVAL_SECS_VAR, defaults.interval)?,
         batch: defaults.batch,
     })
+}
+
+/// Reads the report email queue URLs: both set (queue mode) or both unset or
+/// blank (in-process send). One without the other fails, naming the variable
+/// that is missing and never a value.
+fn read_report_email_queue(
+    lookup: &impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<ReportEmailQueueUrls>, ConfigError> {
+    let queue_url = read_optional(lookup, REPORT_EMAIL_QUEUE_URL_VAR);
+    let dlq_url = read_optional(lookup, REPORT_EMAIL_DLQ_URL_VAR);
+    match (queue_url, dlq_url) {
+        (None, None) => Ok(None),
+        (Some(queue_url), Some(dlq_url)) => Ok(Some(ReportEmailQueueUrls { queue_url, dlq_url })),
+        (Some(_), None) => Err(ConfigError::IncompleteReportEmailQueue {
+            missing: REPORT_EMAIL_DLQ_URL_VAR,
+        }),
+        (None, Some(_)) => Err(ConfigError::IncompleteReportEmailQueue {
+            missing: REPORT_EMAIL_QUEUE_URL_VAR,
+        }),
+    }
 }
 
 /// Lee `ADMIN_BOOTSTRAP_EMAILS`: ausente = sin administradores. Un valor que
@@ -530,6 +573,14 @@ pub enum ConfigError {
         variable: &'static str,
         /// Smallest accepted value, in seconds.
         minimum_secs: u64,
+    },
+    /// Only one of the two report email queue URLs is set.
+    #[error(
+        "REPORT_EMAIL_QUEUE_URL and REPORT_EMAIL_DLQ_URL must be set together: {missing} is missing"
+    )]
+    IncompleteReportEmailQueue {
+        /// Name of the variable that is missing.
+        missing: &'static str,
     },
     /// Alguna entrada de `NETWORK_SCAN_EMAILS` no es un correo válido. No
     /// incluye el valor, que puede ser un correo real mal escrito.
@@ -1189,5 +1240,60 @@ mod tests {
         env.set("REPORT_EMAIL_REAPER_AFTER_SECS", "65");
         let reaper = env.load().unwrap().report_email_reaper;
         assert_eq!(reaper.after, Duration::from_secs(65));
+    }
+
+    #[test]
+    fn the_report_email_queue_is_off_when_both_urls_are_unset_or_blank() {
+        assert!(FakeEnv::valid()
+            .load()
+            .unwrap()
+            .report_email_queue
+            .is_none());
+        let mut env = FakeEnv::valid();
+        env.set("REPORT_EMAIL_QUEUE_URL", "  ");
+        env.set("REPORT_EMAIL_DLQ_URL", "");
+        assert!(env.load().unwrap().report_email_queue.is_none());
+    }
+
+    #[test]
+    fn the_report_email_queue_loads_both_urls_trimmed() {
+        let mut env = FakeEnv::valid();
+        env.set(
+            "REPORT_EMAIL_QUEUE_URL",
+            " http://localhost:4566/000000000000/q ",
+        );
+        env.set(
+            "REPORT_EMAIL_DLQ_URL",
+            "http://localhost:4566/000000000000/dlq",
+        );
+        let queue = env.load().unwrap().report_email_queue.expect("queue mode");
+        assert_eq!(queue.queue_url, "http://localhost:4566/000000000000/q");
+        assert_eq!(queue.dlq_url, "http://localhost:4566/000000000000/dlq");
+    }
+
+    #[test]
+    fn one_queue_url_without_the_other_fails_naming_the_missing_variable() {
+        for (set, missing) in [
+            ("REPORT_EMAIL_QUEUE_URL", "REPORT_EMAIL_DLQ_URL"),
+            ("REPORT_EMAIL_DLQ_URL", "REPORT_EMAIL_QUEUE_URL"),
+        ] {
+            let mut env = FakeEnv::valid();
+            env.set(set, "http://localhost:4566/000000000000/x");
+            let error = env.load().unwrap_err().to_string();
+            assert!(error.contains(missing), "{error}");
+            assert!(!error.contains("localhost"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_blank_queue_url_next_to_a_real_one_still_fails() {
+        let mut env = FakeEnv::valid();
+        env.set(
+            "REPORT_EMAIL_QUEUE_URL",
+            "http://localhost:4566/000000000000/x",
+        );
+        env.set("REPORT_EMAIL_DLQ_URL", "   ");
+        let error = env.load().unwrap_err().to_string();
+        assert!(error.contains("REPORT_EMAIL_DLQ_URL"), "{error}");
     }
 }

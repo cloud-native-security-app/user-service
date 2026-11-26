@@ -162,6 +162,7 @@ async fn start_running_service_full(
         aws_endpoint_url: None,
         smtp: None,
         report_email_reaper: Default::default(),
+        report_email_queue: None,
     };
 
     let app = wiring::build_router(&config)

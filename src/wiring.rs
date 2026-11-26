@@ -31,11 +31,18 @@ use axum::routing::get;
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::api;
 use crate::config::Config;
 use crate::messaging::kinesis::KinesisSecurityEventPublisher;
+use crate::messaging::sqs::{QueueSetupError, SqsReportEmailConsumer, SqsReportEmailPublisher};
 use crate::report_email::mailer::Mailer;
+use crate::report_email::queue::{
+    check_lease_covers_attempt, check_reaper_window, LeaseTooShortError, ReaperWindowError,
+    ReportEmailRequestPublisher,
+};
 use crate::report_email::service::{ReportEmailService, RetryPolicy};
 use crate::report_email::smtp::SmtpMailer;
 use crate::repository::Repository;
@@ -49,6 +56,16 @@ use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher}
 /// sana o recién levantada y, si no responde, el proceso falla con un error
 /// tipado lo bastante rápido para que el orquestador lo reinicie.
 const DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The assembled service: the HTTP router and, in queue mode, the report email
+/// consumer task. The consumer stops when the token given to [`build_app`] is
+/// cancelled; await `consumer` afterwards so an in-flight email finishes.
+pub struct App {
+    /// The complete `axum` router.
+    pub router: Router,
+    /// The report email consumer task, `None` without the queue.
+    pub consumer: Option<JoinHandle<()>>,
+}
 
 /// Aplica las migraciones pendientes de `migrations/` contra
 /// [`Config::migrations_database_url`] y, si tiene éxito, construye el
@@ -65,17 +82,33 @@ const DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Devuelve [`WiringError`] si no se puede conectar con cualquiera de los
 /// dos pools, o si la aplicación de migraciones falla. Nunca hace
 /// `panic!` ni deja el router a medio ensamblar.
+///
+/// Si hay cola del correo del informe, el consumidor queda en una tarea que
+/// nadie detiene: usa [`build_app`] cuando haga falta un apagado ordenado.
 pub async fn build_router(config: &Config) -> Result<Router, WiringError> {
-    build_router_with_connect_timeout(config, DATABASE_CONNECT_TIMEOUT).await
+    Ok(build_app(config, CancellationToken::new()).await?.router)
 }
 
-/// Igual que [`build_router`], pero con un `connect_timeout` explícito para
+/// Igual que [`build_router`], pero devuelve también la tarea del consumidor de
+/// la cola del correo del informe (si está configurada), que se detiene al
+/// cancelar `shutdown`.
+///
+/// # Errores
+///
+/// Los de [`build_router`], más [`WiringError::ReportEmailQueueUnavailable`] y
+/// [`WiringError::ReaperWindowTooShort`] en modo cola.
+pub async fn build_app(config: &Config, shutdown: CancellationToken) -> Result<App, WiringError> {
+    build_app_with_connect_timeout(config, shutdown, DATABASE_CONNECT_TIMEOUT).await
+}
+
+/// Igual que [`build_app`], pero con un `connect_timeout` explícito para
 /// ambos pools; permite a los tests usar un límite corto sin cambiar el
 /// valor de producción.
-async fn build_router_with_connect_timeout(
+async fn build_app_with_connect_timeout(
     config: &Config,
+    shutdown: CancellationToken,
     connect_timeout: Duration,
-) -> Result<Router, WiringError> {
+) -> Result<App, WiringError> {
     migrate(&config.migrations_database_url, connect_timeout).await?;
 
     let database_pool = PgPoolOptions::new()
@@ -116,23 +149,79 @@ async fn build_router_with_connect_timeout(
     let mailer = build_mailer(config);
     // The reaper retries sends lost to a shutdown or crash; it only runs when
     // email is enabled (it never starts without a mailer).
+    // One policy for the service, the API fallback and the startup checks.
+    let retry = RetryPolicy::default();
     let reaper = Arc::new(ReportEmailService::new(
         repository.clone(),
         mailer.clone(),
-        RetryPolicy::default(),
+        retry,
     ));
-    reaper.spawn_reaper(config.report_email_reaper);
 
-    let api_router = api::router_with_shared_repository(
+    // Queue mode: read the queue attributes first, so a reaper window that
+    // could take a live message's row fails the startup before anything runs.
+    let (consumer, report_publisher) = match &config.report_email_queue {
+        Some(urls) => {
+            let consumer = SqsReportEmailConsumer::connect(
+                config.aws_region.as_deref(),
+                config.aws_endpoint_url.as_deref(),
+                urls.queue_url.clone(),
+                urls.dlq_url.clone(),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "report email queue: startup failed");
+                WiringError::ReportEmailQueueUnavailable(error)
+            })?;
+            let settings = consumer.settings();
+            check_lease_covers_attempt(&settings, retry.attempt_timeout).map_err(|source| {
+                WiringError::QueueLeaseTooShort {
+                    queue: urls.queue_url.clone(),
+                    source,
+                }
+            })?;
+            // The reaper only runs with a mailer, so only then can it race.
+            if mailer.is_some() {
+                check_reaper_window(
+                    &settings,
+                    config.report_email_reaper.after,
+                    retry.attempt_timeout,
+                )?;
+            }
+            tracing::info!(
+                visibility_timeout_secs = settings.visibility_timeout.as_secs(),
+                max_receives = settings.max_receives,
+                "report email: sending through the SQS queue"
+            );
+            let publisher: Arc<dyn ReportEmailRequestPublisher> =
+                Arc::new(SqsReportEmailPublisher::from_client(
+                    consumer.client().clone(),
+                    urls.queue_url.clone(),
+                ));
+            (Some(consumer), Some(publisher))
+        }
+        None => (None, None),
+    };
+
+    reaper.spawn_reaper(config.report_email_reaper);
+    let consumer = consumer.map(|consumer| {
+        let service = reaper.clone();
+        tokio::spawn(async move { consumer.run(service, shutdown).await })
+    });
+
+    let api_router = api::router_with_report_queue(
         repository,
         config.gateway_shared_secret.clone(),
-        Some((mailer, RetryPolicy::default())),
+        Some((mailer, retry)),
+        report_publisher,
     );
     let health_router = Router::new()
         .route("/health", get(health))
         .with_state(health_pool);
 
-    Ok(health_router.merge(api_router))
+    Ok(App {
+        router: health_router.merge(api_router),
+        consumer,
+    })
 }
 
 /// Builds the SMTP mailer, or `None` (report email disabled) when `SMTP_HOST`
@@ -237,6 +326,21 @@ pub enum WiringError {
     /// `NETWORK_SCAN_EMAILS`.
     #[error("fallo al reconciliar el permiso de escaneo de red")]
     NetworkScanBootstrapFailed,
+    /// The report email queue could not be read or is not usable at startup.
+    #[error("la cola del correo del informe no está disponible: {0}")]
+    ReportEmailQueueUnavailable(#[from] QueueSetupError),
+    /// The lease of the queue does not exceed one SMTP attempt.
+    #[error("la cola {queue} no sirve para el correo del informe: {source}")]
+    QueueLeaseTooShort {
+        /// URL of the queue.
+        queue: String,
+        /// The values compared.
+        #[source]
+        source: LeaseTooShortError,
+    },
+    /// `REPORT_EMAIL_REAPER_AFTER_SECS` does not outlast the queue window.
+    #[error("{0}")]
+    ReaperWindowTooShort(#[from] ReaperWindowError),
 }
 
 #[cfg(test)]
@@ -282,13 +386,18 @@ mod tests {
             aws_endpoint_url: None,
             smtp: None,
             report_email_reaper: Default::default(),
+            report_email_queue: None,
         };
 
         // Cota de seguridad ante cuelgues: con `acquire_timeout` de 1 s el
         // fallo llega en ~1 s; 10 s detecta una regresión (antes: 30 s).
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            build_router_with_connect_timeout(&config, Duration::from_secs(1)),
+            build_app_with_connect_timeout(
+                &config,
+                CancellationToken::new(),
+                Duration::from_secs(1),
+            ),
         )
         .await
         .expect("la conexión inalcanzable debe fallar dentro de una cota, no colgarse");
