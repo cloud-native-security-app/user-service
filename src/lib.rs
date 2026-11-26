@@ -50,26 +50,69 @@ pub async fn run() -> Result<(), RunError> {
         .await
         .map_err(RunError::Bind)?;
 
+    let supervisor =
+        consumer.map(|consumer| tokio::spawn(supervise_consumer(consumer, shutdown.clone())));
+
     let signal_token = shutdown.clone();
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!(
-                "shutdown signal received: stopping the HTTP server and the queue consumer"
-            );
-            signal_token.cancel();
+            tokio::select! {
+                () = shutdown_signal() => {
+                    tracing::info!(
+                        "shutdown signal received: stopping the HTTP server and the queue consumer"
+                    );
+                    signal_token.cancel();
+                }
+                // The supervisor cancels the token when the consumer dies.
+                () = signal_token.cancelled() => {}
+            }
         })
         .await;
 
     // Also reached when the server fails: stop the consumer and let an
     // in-flight email finish before the process exits.
     shutdown.cancel();
-    if let Some(consumer) = consumer {
-        if consumer.await.is_err() {
-            tracing::error!("the report email consumer task ended abnormally");
-        }
+    let consumer_end = match supervisor {
+        Some(supervisor) => supervisor.await.unwrap_or(ConsumerEnd::Died),
+        None => ConsumerEnd::Stopped,
+    };
+    served.map_err(RunError::Serve)?;
+    match consumer_end {
+        ConsumerEnd::Stopped => Ok(()),
+        ConsumerEnd::Died => Err(RunError::ConsumerDied),
     }
-    served.map_err(RunError::Serve)
+}
+
+/// How the report email consumer task ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsumerEnd {
+    /// It stopped because `shutdown` was cancelled.
+    Stopped,
+    /// It ended (panic or return) while the service was still running.
+    Died,
+}
+
+/// Waits for the report email consumer task. If it ends before `shutdown` is
+/// cancelled, logs it and cancels `shutdown`, so the HTTP server stops too and
+/// [`run`] fails: ECS then replaces the task instead of leaving it serving HTTP
+/// with nobody consuming the queue.
+async fn supervise_consumer(
+    consumer: tokio::task::JoinHandle<()>,
+    shutdown: CancellationToken,
+) -> ConsumerEnd {
+    let result = consumer.await;
+    if shutdown.is_cancelled() {
+        if result.is_err() {
+            tracing::error!("the report email consumer task ended abnormally during shutdown");
+        }
+        return ConsumerEnd::Stopped;
+    }
+    tracing::error!(
+        panicked = result.is_err(),
+        "the report email consumer stopped while the service was running: shutting down so the task is replaced"
+    );
+    shutdown.cancel();
+    ConsumerEnd::Died
 }
 
 /// Completes on Ctrl-C (`SIGINT`) or, on Unix, `SIGTERM` (what ECS sends to
@@ -104,7 +147,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// Error devuelto por [`run`] cuando el servicio no puede arrancar.
+/// Error devuelto por [`run`] cuando el servicio no puede arrancar o termina por un fallo.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     /// La configuración del servicio no pudo cargarse desde variables de
@@ -121,4 +164,46 @@ pub enum RunError {
     /// El servidor HTTP terminó con un error durante su ejecución.
     #[error("el servidor HTTP terminó con un error: {0}")]
     Serve(std::io::Error),
+    /// The report email queue consumer ended while the service was running.
+    #[error("the report email queue consumer stopped unexpectedly")]
+    ConsumerDied,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_consumer_that_panics_while_running_is_reported_and_stops_the_service() {
+        let shutdown = CancellationToken::new();
+        let consumer = tokio::spawn(async { panic!("consumer bug") });
+
+        let end = supervise_consumer(consumer, shutdown.clone()).await;
+
+        assert_eq!(end, ConsumerEnd::Died);
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_consumer_that_returns_while_running_is_reported_and_stops_the_service() {
+        let shutdown = CancellationToken::new();
+        let consumer = tokio::spawn(async {});
+
+        let end = supervise_consumer(consumer, shutdown.clone()).await;
+
+        assert_eq!(end, ConsumerEnd::Died);
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_consumer_that_stops_after_shutdown_is_a_normal_stop() {
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let consumer = tokio::spawn(async move { token.cancelled().await });
+
+        shutdown.cancel();
+        let end = supervise_consumer(consumer, shutdown.clone()).await;
+
+        assert_eq!(end, ConsumerEnd::Stopped);
+    }
 }
