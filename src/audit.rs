@@ -44,12 +44,17 @@ pub const REPORT_EMAIL_FAILED_ACTION: &str = "report.email_failed";
 /// | [`SCAN_REQUESTED_ACTION`] (`scan_requested`) | `scan.requested` | `scan` |
 /// | [`ROLE_GRANTED_ACTION`] (`role.granted`) | `role.granted` | `user` |
 /// | [`ROLE_REVOKED_ACTION`] (`role.revoked`) | `role.revoked` | `user` |
+/// | [`REPORT_EMAILED_ACTION`] (`report.emailed`) | `report.emailed` | `scan` |
+/// | [`REPORT_EMAIL_FAILED_ACTION`] (`report.email_failed`) | `report.email_failed` | `scan` |
 ///
 /// `actor_sub` es el `user_id` de la entrada: en `scan_requested`, el usuario
 /// que pidió el escaneo (quien actúa); en `role.granted`/`role.revoked`, el
 /// usuario cuyo rol cambió (el sujeto; el cambio lo hace la lista
-/// `ADMIN_BOOTSTRAP_EMAILS`, no una persona). El `target` (IP del escaneo o rol
-/// resultante) y el identificador de la entrada no se publican.
+/// `ADMIN_BOOTSTRAP_EMAILS`, no una persona); en `report.emailed`/
+/// `report.email_failed`, el dueño del escaneo (el destinatario; el envío lo
+/// hace el servicio, no una persona). El `target` (IP del escaneo, rol
+/// resultante o id del escaneo) y el identificador de la entrada no se
+/// publican.
 ///
 /// # Errores
 ///
@@ -60,6 +65,8 @@ pub fn recorded_event(entry: &AuditEntry) -> Result<SecurityEvent, InvalidSecuri
         SCAN_REQUESTED_ACTION => ("scan.requested", "scan"),
         ROLE_GRANTED_ACTION => (ROLE_GRANTED_ACTION, "user"),
         ROLE_REVOKED_ACTION => (ROLE_REVOKED_ACTION, "user"),
+        REPORT_EMAILED_ACTION => (REPORT_EMAILED_ACTION, "scan"),
+        REPORT_EMAIL_FAILED_ACTION => (REPORT_EMAIL_FAILED_ACTION, "scan"),
         _ => {
             return Err(InvalidSecurityEvent {
                 event_type: "audit.recorded",
@@ -104,6 +111,18 @@ mod tests {
             assert_eq!(
                 event.payload(),
                 &serde_json::json!({"action": action, "resource_type": "user"})
+            );
+        }
+    }
+
+    #[test]
+    fn report_email_outcomes_map_to_their_own_action_on_a_scan_with_the_owner_as_actor() {
+        for action in [REPORT_EMAILED_ACTION, REPORT_EMAIL_FAILED_ACTION] {
+            let event = recorded_event(&entry("user-sub-3", action)).unwrap();
+            assert_eq!(event.actor_sub(), Some("user-sub-3"));
+            assert_eq!(
+                event.payload(),
+                &serde_json::json!({"action": action, "resource_type": "scan"})
             );
         }
     }
